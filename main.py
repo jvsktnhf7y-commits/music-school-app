@@ -270,6 +270,8 @@ def school_page(title, content, active):
         ("teachers",  "/school/teachers",  "👩‍🏫", "Teachers"),
         ("students",  "/school/students",  "👥", "All Students"),
         ("analytics", "/school/analytics", "📊", "Analytics"),
+        ("policies",  "/school/policies",  "📋", "Policies"),
+        ("billing",   "/school/billing",   "💳", "Billing"),
         ("settings",  "/school/settings",  "⚙️",  "Settings"),
     ], "/school/logout")
 
@@ -1110,13 +1112,9 @@ async def teacher_add_note_post(request: Request,
     teacher = _require_teacher(request)
     if not teacher: return RedirectResponse("/teacher/login", status_code=303)
     student = get_student(student_id)
-    _append_csv(NOTES_FILE, NOTES_HEADERS, {
-        "id": secrets.token_hex(6), "school_id": teacher["school_id"],
-        "teacher_id": teacher["teacher_id"], "student_id": student_id,
-        "student_name": student.get("name","") if student else "",
-        "date": date, "notes": notes.strip(), "assignment": assignment.strip(),
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    })
+    if student:
+        _save_note_and_notify(teacher, student_id, student, date,
+                              notes.strip(), assignment.strip())
     return RedirectResponse("/teacher/notes?toast=Note+saved", status_code=303)
 
 
@@ -1388,3 +1386,811 @@ def serve_css():
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MOBILE API
+# ═══════════════════════════════════════════════════════════════════════════════
+
+PUSH_TOKENS_FILE = "/data/push_tokens.json"
+
+def _load_push_tokens() -> dict:
+    if os.path.exists(PUSH_TOKENS_FILE):
+        try:
+            with open(PUSH_TOKENS_FILE) as f: return json.load(f)
+        except Exception: pass
+    return {}
+
+def _save_push_tokens(t: dict):
+    with open(PUSH_TOKENS_FILE, "w") as f: json.dump(t, f)
+
+def _send_push(token: str, title: str, body: str, data: dict = None):
+    try:
+        import urllib.request as _ur
+        payload = json.dumps({
+            "to": token, "title": title, "body": body,
+            "data": data or {}, "sound": "default",
+        }).encode()
+        req = _ur.Request("https://exp.host/--/api/v2/push/send", data=payload,
+                          headers={"Content-Type": "application/json", "Accept": "application/json"})
+        _ur.urlopen(req, timeout=5)
+    except Exception as e:
+        print(f"[Push error] {e}")
+
+# ── School Admin mobile auth ───────────────────────────────────────────────────
+@app.post("/api/mobile/school/login")
+async def mobile_school_login(request: Request):
+    ip = request.client.host
+    if _rl_blocked(ip):
+        return JSONResponse({"ok": False, "error": "Too many attempts"}, status_code=429)
+    data   = await request.json()
+    email  = data.get("email", "").strip().lower()
+    pw     = data.get("password", "")
+    school = get_school_by_email(email)
+    if school and school["password_hash"] == _hash(pw):
+        _rl_clear(ip)
+        return JSONResponse({"ok": True, "session": school["school_id"],
+                             "school_name": school["name"], "role": "school"})
+    _rl_fail(ip)
+    return JSONResponse({"ok": False, "error": "Invalid credentials"}, status_code=401)
+
+def _school_auth(request: Request) -> dict | None:
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer school:"):
+        return None
+    sid = auth.removeprefix("Bearer school:").strip()
+    return get_school(sid)
+
+@app.get("/api/mobile/school/dashboard")
+def mobile_school_dashboard(request: Request):
+    school = _school_auth(request)
+    if not school: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    sid      = school["school_id"]
+    teachers = get_teachers(sid)
+    students = get_all_school_students(sid)
+    now      = datetime.now()
+    this_month = month_revenue(sid, now.year, now.month)
+    total_rev  = school_revenue(sid)
+    return JSONResponse({
+        "ok": True,
+        "school_name": school["name"],
+        "teacher_count": len(teachers),
+        "student_count": len(students),
+        "this_month": round(this_month, 2),
+        "total_revenue": round(total_rev, 2),
+    })
+
+@app.get("/api/mobile/school/teachers")
+def mobile_school_teachers(request: Request):
+    school = _school_auth(request)
+    if not school: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    students = get_all_school_students(school["school_id"])
+    teachers = get_teachers(school["school_id"])
+    result = []
+    for t in teachers:
+        result.append({
+            "teacher_id": t["teacher_id"],
+            "name": t["name"],
+            "email": t["email"],
+            "student_count": len([s for s in students if s["teacher_id"] == t["teacher_id"]]),
+            "revenue": round(teacher_revenue(t["teacher_id"]), 2),
+        })
+    return JSONResponse({"ok": True, "teachers": result})
+
+@app.get("/api/mobile/school/analytics")
+def mobile_school_analytics(request: Request):
+    school = _school_auth(request)
+    if not school: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    sid    = school["school_id"]
+    now    = datetime.now()
+    monthly = []
+    for i in range(5, -1, -1):
+        m = now.month - i; y = now.year
+        while m <= 0: m += 12; y -= 1
+        rev = month_revenue(sid, y, m)
+        monthly.append({"label": datetime(y, m, 1).strftime("%b %Y"), "rev": round(rev, 2)})
+    return JSONResponse({"ok": True, "monthly": monthly,
+                         "total_revenue": round(school_revenue(sid), 2),
+                         "teacher_count": len(get_teachers(sid)),
+                         "student_count": len(get_all_school_students(sid))})
+
+# ── Teacher mobile auth ────────────────────────────────────────────────────────
+@app.post("/api/mobile/teacher/login")
+async def mobile_teacher_login(request: Request):
+    ip = request.client.host
+    if _rl_blocked(ip):
+        return JSONResponse({"ok": False, "error": "Too many attempts"}, status_code=429)
+    data    = await request.json()
+    email   = data.get("email", "").strip().lower()
+    pw      = data.get("password", "")
+    teacher = get_teacher_by_email(email)
+    if teacher and teacher["password_hash"] == _hash(pw) and teacher.get("active","true") == "true":
+        _rl_clear(ip)
+        return JSONResponse({"ok": True, "session": teacher["teacher_id"],
+                             "name": teacher["name"], "role": "teacher"})
+    _rl_fail(ip)
+    return JSONResponse({"ok": False, "error": "Invalid credentials"}, status_code=401)
+
+def _teacher_auth(request: Request) -> dict | None:
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer teacher:"):
+        return None
+    tid = auth.removeprefix("Bearer teacher:").strip()
+    return get_teacher(tid)
+
+@app.get("/api/mobile/teacher/dashboard")
+def mobile_teacher_dashboard(request: Request):
+    teacher = _teacher_auth(request)
+    if not teacher: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    students = get_students(teacher["teacher_id"])
+    now = datetime.now()
+    this_month = sum(
+        float(r.get("amount", 0)) for r in _read_csv(LEDGER_FILE, LEDGER_HEADERS)
+        if r["teacher_id"] == teacher["teacher_id"]
+        and r.get("date", "").startswith(f"{now.year}-{now.month:02d}")
+        and float(r.get("amount", 0)) > 0
+    )
+    balances = [{"name": s["name"], "prepaid": float(s.get("prepaid", 0)),
+                 "rate": float(s.get("rate", 50))} for s in students]
+    return JSONResponse({"ok": True, "name": teacher["name"],
+                         "student_count": len(students),
+                         "this_month": round(this_month, 2),
+                         "total_revenue": round(teacher_revenue(teacher["teacher_id"]), 2),
+                         "balances": balances})
+
+@app.get("/api/mobile/teacher/students")
+def mobile_teacher_students(request: Request):
+    teacher = _teacher_auth(request)
+    if not teacher: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    students = get_students(teacher["teacher_id"])
+    return JSONResponse({"ok": True, "students": [
+        {"student_id": s["student_id"], "name": s["name"],
+         "rate": float(s.get("rate", 50)), "prepaid": float(s.get("prepaid", 0)),
+         "parent_email": s.get("parent_email", "")} for s in students
+    ]})
+
+@app.post("/api/mobile/teacher/students/add")
+async def mobile_teacher_add_student(request: Request):
+    teacher = _teacher_auth(request)
+    if not teacher: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    data = await request.json()
+    name = data.get("name", "").strip()
+    if not name: return JSONResponse({"ok": False, "error": "name required"}, status_code=400)
+    student_id = secrets.token_hex(8)
+    _append_csv(STUDENTS_FILE, STUDENTS_HEADERS, {
+        "student_id":   student_id,
+        "school_id":    teacher["school_id"],
+        "teacher_id":   teacher["teacher_id"],
+        "name":         name,
+        "rate":         f"{float(data.get('rate', 50)):.2f}",
+        "parent_email": data.get("parent_email", "").strip().lower(),
+        "parent_code":  data.get("parent_code", "").strip(),
+        "access_code":  "",
+        "prepaid":      f"{float(data.get('prepaid', 0)):.2f}",
+        "created_at":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    return JSONResponse({"ok": True, "student_id": student_id})
+
+@app.get("/api/mobile/teacher/students/{student_id}")
+def mobile_teacher_student_detail(student_id: str, request: Request):
+    teacher = _teacher_auth(request)
+    if not teacher: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    student = get_student(student_id)
+    if not student or student["teacher_id"] != teacher["teacher_id"]:
+        return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
+    notes  = [r for r in _read_csv(NOTES_FILE, NOTES_HEADERS) if r["student_id"] == student_id]
+    notes.sort(key=lambda r: r.get("date", ""), reverse=True)
+    ledger = [r for r in _read_csv(LEDGER_FILE, LEDGER_HEADERS) if r["student_id"] == student_id]
+    return JSONResponse({"ok": True,
+        "student": {"student_id": student["student_id"], "name": student["name"],
+                    "rate": float(student.get("rate", 50)),
+                    "prepaid": float(student.get("prepaid", 0)),
+                    "parent_email": student.get("parent_email", ""),
+                    "parent_code": student.get("parent_code", "")},
+        "notes": [{"date": n["date"], "notes": n["notes"], "assignment": n["assignment"]}
+                  for n in notes[:10]],
+        "total_charged": round(sum(float(r.get("amount", 0)) for r in ledger), 2),
+    })
+
+@app.post("/api/mobile/teacher/students/{student_id}/charge")
+async def mobile_teacher_charge(student_id: str, request: Request):
+    teacher = _teacher_auth(request)
+    if not teacher: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    data   = await request.json()
+    amount = float(data.get("amount", 0))
+    student = get_student(student_id)
+    if not student: return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
+    rows = _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
+    for r in rows:
+        if r["student_id"] == student_id:
+            r["prepaid"] = f"{float(r.get('prepaid', 0)) - amount:.2f}"
+    _write_csv(STUDENTS_FILE, STUDENTS_HEADERS, rows)
+    _append_csv(LEDGER_FILE, LEDGER_HEADERS, {
+        "id": secrets.token_hex(6), "school_id": teacher["school_id"],
+        "teacher_id": teacher["teacher_id"], "student_id": student_id,
+        "student_name": student.get("name", ""),
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "status": "Lesson Charged", "amount": f"-{amount:.2f}", "notes": "",
+    })
+    return JSONResponse({"ok": True, "new_balance": float(student.get("prepaid", 0)) - amount})
+
+@app.post("/api/mobile/teacher/students/{student_id}/payment")
+async def mobile_teacher_payment(student_id: str, request: Request):
+    teacher = _teacher_auth(request)
+    if not teacher: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    data   = await request.json()
+    amount = float(data.get("amount", 0))
+    student = get_student(student_id)
+    if not student: return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
+    rows = _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
+    for r in rows:
+        if r["student_id"] == student_id:
+            r["prepaid"] = f"{float(r.get('prepaid', 0)) + amount:.2f}"
+    _write_csv(STUDENTS_FILE, STUDENTS_HEADERS, rows)
+    _append_csv(LEDGER_FILE, LEDGER_HEADERS, {
+        "id": secrets.token_hex(6), "school_id": teacher["school_id"],
+        "teacher_id": teacher["teacher_id"], "student_id": student_id,
+        "student_name": student.get("name", ""),
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "status": "Payment", "amount": f"{amount:.2f}",
+        "notes": data.get("notes", ""),
+    })
+    return JSONResponse({"ok": True, "new_balance": float(student.get("prepaid", 0)) + amount})
+
+@app.get("/api/mobile/teacher/notes")
+def mobile_teacher_notes(request: Request):
+    teacher = _teacher_auth(request)
+    if not teacher: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    notes = [r for r in _read_csv(NOTES_FILE, NOTES_HEADERS)
+             if r["teacher_id"] == teacher["teacher_id"]]
+    notes.sort(key=lambda r: r.get("date", ""), reverse=True)
+    return JSONResponse({"ok": True, "notes": [
+        {"id": n["id"], "student_name": n["student_name"],
+         "date": n["date"], "notes": n["notes"], "assignment": n["assignment"]}
+        for n in notes[:50]
+    ]})
+
+@app.post("/api/mobile/teacher/notes/add")
+async def mobile_teacher_add_note(request: Request):
+    teacher = _teacher_auth(request)
+    if not teacher: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    data       = await request.json()
+    student_id = data.get("student_id", "").strip()
+    student    = get_student(student_id)
+    if not student: return JSONResponse({"ok": False, "error": "student not found"}, status_code=404)
+    _save_note_and_notify(teacher, student_id, student,
+                          data.get("date", datetime.now().strftime("%Y-%m-%d")),
+                          data.get("notes", "").strip(),
+                          data.get("assignment", "").strip())
+    return JSONResponse({"ok": True})
+
+@app.get("/api/mobile/teacher/payments")
+def mobile_teacher_payments(request: Request):
+    teacher = _teacher_auth(request)
+    if not teacher: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    ledger = [r for r in _read_csv(LEDGER_FILE, LEDGER_HEADERS)
+              if r["teacher_id"] == teacher["teacher_id"]]
+    ledger.sort(key=lambda r: r.get("date", ""), reverse=True)
+    return JSONResponse({"ok": True, "transactions": [
+        {"date": r["date"], "student_name": r["student_name"],
+         "status": r["status"], "amount": float(r.get("amount", 0))}
+        for r in ledger[:100]
+    ]})
+
+@app.post("/api/mobile/teacher/register-push")
+async def mobile_teacher_register_push(request: Request):
+    teacher = _teacher_auth(request)
+    if not teacher: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    data   = await request.json()
+    token  = data.get("token", "")
+    tokens = _load_push_tokens()
+    tokens[f"teacher:{teacher['teacher_id']}"] = token
+    _save_push_tokens(tokens)
+    return JSONResponse({"ok": True})
+
+# ── Parent mobile auth ─────────────────────────────────────────────────────────
+@app.post("/api/mobile/parent/login")
+async def mobile_parent_login(request: Request):
+    ip = request.client.host
+    if _rl_blocked(ip):
+        return JSONResponse({"ok": False, "error": "Too many attempts"}, status_code=429)
+    data   = await request.json()
+    name   = data.get("student_name", "").strip().lower()
+    code   = data.get("parent_code", "").strip()
+    students = _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
+    match = next((s for s in students
+                  if s["name"].lower() == name and s.get("parent_code", "") == code), None)
+    if match:
+        _rl_clear(ip)
+        return JSONResponse({"ok": True, "session": match["student_id"],
+                             "student_name": match["name"], "role": "parent"})
+    _rl_fail(ip)
+    return JSONResponse({"ok": False, "error": "Invalid name or code"}, status_code=401)
+
+def _parent_auth(request: Request) -> dict | None:
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer parent:"):
+        return None
+    sid = auth.removeprefix("Bearer parent:").strip()
+    return get_student(sid)
+
+@app.get("/api/mobile/parent/dashboard")
+def mobile_parent_dashboard(request: Request):
+    student = _parent_auth(request)
+    if not student: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    notes = [r for r in _read_csv(NOTES_FILE, NOTES_HEADERS)
+             if r["student_id"] == student["student_id"]]
+    notes.sort(key=lambda r: r.get("date", ""), reverse=True)
+    latest = notes[0] if notes else None
+    return JSONResponse({"ok": True,
+        "student_name": student["name"],
+        "prepaid": float(student.get("prepaid", 0)),
+        "rate": float(student.get("rate", 50)),
+        "latest_note": {"date": latest["date"], "notes": latest["notes"],
+                        "assignment": latest["assignment"]} if latest else None,
+    })
+
+@app.get("/api/mobile/parent/notes")
+def mobile_parent_notes(request: Request):
+    student = _parent_auth(request)
+    if not student: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    notes = [r for r in _read_csv(NOTES_FILE, NOTES_HEADERS)
+             if r["student_id"] == student["student_id"]]
+    notes.sort(key=lambda r: r.get("date", ""), reverse=True)
+    return JSONResponse({"ok": True, "notes": [
+        {"date": n["date"], "notes": n["notes"], "assignment": n["assignment"]}
+        for n in notes
+    ]})
+
+@app.get("/api/mobile/parent/payments")
+def mobile_parent_payments(request: Request):
+    student = _parent_auth(request)
+    if not student: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    ledger = [r for r in _read_csv(LEDGER_FILE, LEDGER_HEADERS)
+              if r["student_id"] == student["student_id"]]
+    ledger.sort(key=lambda r: r.get("date", ""), reverse=True)
+    return JSONResponse({"ok": True,
+        "prepaid": float(student.get("prepaid", 0)),
+        "rate": float(student.get("rate", 50)),
+        "transactions": [{"date": r["date"], "status": r["status"],
+                          "amount": float(r.get("amount", 0))} for r in ledger],
+    })
+
+@app.post("/api/mobile/parent/register-push")
+async def mobile_parent_register_push(request: Request):
+    student = _parent_auth(request)
+    if not student: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    data   = await request.json()
+    token  = data.get("token", "")
+    tokens = _load_push_tokens()
+    tokens[f"parent:{student['student_id']}"] = token
+    _save_push_tokens(tokens)
+    return JSONResponse({"ok": True})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SESSION 2: Stripe billing · Push on note · Policy signing · Waitlist
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import stripe, threading
+
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+WAITLIST_FILE = "/data/waitlist.csv"
+POLICIES_FILE = "/data/policies.csv"
+SIGNATURES_FILE = "/data/signatures.csv"
+
+WAITLIST_HEADERS   = ["id", "email", "created_at"]
+POLICIES_HEADERS   = ["id", "school_id", "title", "body", "created_at"]
+SIGNATURES_HEADERS = ["id", "policy_id", "school_id", "student_id",
+                      "student_name", "signed_at"]
+
+PLAN_PRICES = {
+    "solo":   os.environ.get("STRIPE_PRICE_SOLO",   ""),   # $15/mo
+    "school": os.environ.get("STRIPE_PRICE_SCHOOL", ""),   # $99/mo
+}
+
+_init_csv(WAITLIST_FILE,   WAITLIST_HEADERS)
+_init_csv(POLICIES_FILE,   POLICIES_HEADERS)
+_init_csv(SIGNATURES_FILE, SIGNATURES_HEADERS)
+
+
+# ── Push helper: fire in background thread ─────────────────────────────────────
+def _push_parent_note(student_id: str, student_name: str, teacher_name: str):
+    tokens = _load_push_tokens()
+    token  = tokens.get(f"parent:{student_id}")
+    if token:
+        threading.Thread(
+            target=_send_push,
+            args=(token, "New lesson note 🎵",
+                  f"{teacher_name} added a note for {student_name}.",
+                  {"type": "note", "student_id": student_id}),
+            daemon=True,
+        ).start()
+
+
+# ── Patch add-note endpoints to fire push ─────────────────────────────────────
+# We monkey-patch by wrapping _append_csv for notes is complex,
+# so instead we expose a helper called from both web and mobile note saves.
+# The web POST and mobile POST both call _save_note_and_notify below.
+
+def _save_note_and_notify(teacher: dict, student_id: str, student: dict,
+                           date: str, notes: str, assignment: str):
+    _append_csv(NOTES_FILE, NOTES_HEADERS, {
+        "id": secrets.token_hex(6),
+        "school_id":    teacher["school_id"],
+        "teacher_id":   teacher["teacher_id"],
+        "student_id":   student_id,
+        "student_name": student.get("name", ""),
+        "date":         date,
+        "notes":        notes,
+        "assignment":   assignment,
+        "created_at":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    _push_parent_note(student_id, student.get("name", ""), teacher.get("name", ""))
+
+
+# ── Waitlist ───────────────────────────────────────────────────────────────────
+@app.post("/waitlist")
+async def waitlist_signup(request: Request):
+    try:
+        body  = await request.json()
+        email = body.get("email", "").strip().lower()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid body"}, status_code=400)
+    if not email or "@" not in email:
+        return JSONResponse({"ok": False, "error": "invalid email"}, status_code=400)
+    existing = [r for r in _read_csv(WAITLIST_FILE, WAITLIST_HEADERS)
+                if r.get("email") == email]
+    if not existing:
+        _append_csv(WAITLIST_FILE, WAITLIST_HEADERS, {
+            "id": secrets.token_hex(6), "email": email,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    return JSONResponse({"ok": True})
+
+
+# ── Stripe: create checkout session ───────────────────────────────────────────
+@app.post("/api/billing/checkout")
+async def billing_checkout(request: Request):
+    school = _require_school(request)
+    if not school: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    if not STRIPE_SECRET_KEY:
+        return JSONResponse({"ok": False, "error": "Stripe not configured"}, status_code=503)
+    data     = await request.json()
+    plan     = data.get("plan", "solo")
+    price_id = PLAN_PRICES.get(plan)
+    if not price_id:
+        return JSONResponse({"ok": False, "error": "unknown plan"}, status_code=400)
+    stripe.api_key = STRIPE_SECRET_KEY
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            customer_email=school["owner_email"],
+            metadata={"school_id": school["school_id"], "plan": plan},
+            success_url=f"https://music-school-app-hde7.onrender.com/school/dashboard?toast=Subscription+active",
+            cancel_url=f"https://music-school-app-hde7.onrender.com/school/billing",
+        )
+        return JSONResponse({"ok": True, "url": session.url})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+# ── Stripe: webhook ────────────────────────────────────────────────────────────
+@app.post("/api/billing/webhook")
+async def billing_webhook(request: Request):
+    payload   = await request.body()
+    sig_hdr   = request.headers.get("stripe-signature", "")
+    stripe.api_key = STRIPE_SECRET_KEY
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_hdr, STRIPE_WEBHOOK_SECRET)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+    if event["type"] in ("checkout.session.completed",
+                          "customer.subscription.updated"):
+        meta      = event["data"]["object"].get("metadata", {})
+        school_id = meta.get("school_id")
+        plan      = meta.get("plan", "solo")
+        if school_id:
+            schools = _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
+            updated = False
+            for s in schools:
+                if s["school_id"] == school_id:
+                    s["plan"] = plan
+                    updated = True
+            if updated:
+                _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, schools)
+
+    elif event["type"] == "customer.subscription.deleted":
+        sub       = event["data"]["object"]
+        # find school by stripe customer — we store customer_id in metadata at checkout
+        meta      = sub.get("metadata", {})
+        school_id = meta.get("school_id")
+        if school_id:
+            schools = _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
+            for s in schools:
+                if s["school_id"] == school_id:
+                    s["plan"] = "inactive"
+            _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, schools)
+
+    return JSONResponse({"ok": True})
+
+
+# ── Billing page (web) ─────────────────────────────────────────────────────────
+@app.get("/school/billing", response_class=HTMLResponse)
+def school_billing_page(request: Request):
+    school = _require_school(request)
+    if not school: return RedirectResponse("/school/login", status_code=303)
+    plan = school.get("plan", "none")
+    plan_html = {
+        "solo":     '<span class="badge badge-info">Solo — $15/mo</span>',
+        "school":   '<span class="badge badge-success">School — $99/mo</span>',
+        "inactive": '<span class="badge badge-danger">Inactive</span>',
+    }.get(plan, '<span class="badge badge-muted">No plan</span>')
+
+    content = f"""
+    <h1>💳 Billing</h1>
+    <div class="card" style="max-width:520px;">
+      <h2>Current Plan</h2>
+      <p style="margin-bottom:16px;">Active plan: {plan_html}</p>
+      <hr style="border:none;border-top:1px solid var(--border);margin:18px 0;">
+      <h3 style="margin-bottom:14px;">Upgrade / Change Plan</h3>
+      <div style="display:flex;gap:12px;flex-wrap:wrap;">
+        <form method="post" action="/school/billing/checkout">
+          <input type="hidden" name="plan" value="solo">
+          <button class="btn btn-outline" type="submit">Solo — $15/mo<br>
+            <small style="font-weight:400;font-size:11px;">1 teacher, unlimited students</small>
+          </button>
+        </form>
+        <form method="post" action="/school/billing/checkout">
+          <input type="hidden" name="plan" value="school">
+          <button class="btn" type="submit">School — $99/mo<br>
+            <small style="font-weight:400;font-size:11px;">Up to 10 teachers, unlimited students</small>
+          </button>
+        </form>
+      </div>
+    </div>
+    """
+    return HTMLResponse(school_page("Billing", content, "billing"))
+
+
+@app.post("/school/billing/checkout")
+async def school_billing_checkout(request: Request, plan: str = Form(...)):
+    school = _require_school(request)
+    if not school: return RedirectResponse("/school/login", status_code=303)
+    if not STRIPE_SECRET_KEY:
+        return RedirectResponse("/school/billing?toast=Stripe+not+configured", status_code=303)
+    price_id = PLAN_PRICES.get(plan)
+    if not price_id:
+        return RedirectResponse("/school/billing?toast=Unknown+plan", status_code=303)
+    stripe.api_key = STRIPE_SECRET_KEY
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            customer_email=school["owner_email"],
+            metadata={"school_id": school["school_id"], "plan": plan},
+            success_url=f"https://music-school-app-hde7.onrender.com/school/dashboard?toast=Subscription+active",
+            cancel_url=f"https://music-school-app-hde7.onrender.com/school/billing",
+        )
+        return RedirectResponse(session.url, status_code=303)
+    except Exception as e:
+        return RedirectResponse(f"/school/billing?toast={str(e)[:80]}", status_code=303)
+
+
+# ── Policy signing ─────────────────────────────────────────────────────────────
+@app.get("/school/policies", response_class=HTMLResponse)
+def school_policies_page(request: Request, toast: str = ""):
+    school = _require_school(request)
+    if not school: return RedirectResponse("/school/login", status_code=303)
+    policies = [p for p in _read_csv(POLICIES_FILE, POLICIES_HEADERS)
+                if p["school_id"] == school["school_id"]]
+    sigs     = _read_csv(SIGNATURES_FILE, SIGNATURES_HEADERS)
+    toast_html = f'<div class="alert alert-success">{toast}</div>' if toast else ""
+    rows = ""
+    for p in policies:
+        signed_count = len([s for s in sigs if s["policy_id"] == p["id"]])
+        rows += (f'<tr><td><strong>{p["title"]}</strong></td>'
+                 f'<td>{p["created_at"][:10]}</td>'
+                 f'<td><span class="badge badge-info">{signed_count} signed</span></td>'
+                 f'<td><a class="btn btn-sm btn-outline" href="/school/policies/{p["id"]}/sigs">View Signatures</a></td></tr>')
+    table = (f'<table><thead><tr><th>Title</th><th>Created</th><th>Signatures</th><th></th></tr></thead>'
+             f'<tbody>{rows or "<tr><td colspan=4 style=text-align:center;color:var(--muted)>No policies yet.</td></tr>"}</tbody></table>'
+             if policies else
+             '<div class="empty-state"><div class="empty-state-icon">📋</div><p>No policies yet. Add one below.</p></div>')
+    content = f"""
+    <h1>📋 Policies</h1>
+    {toast_html}
+    <div class="card">{table}</div>
+    <div class="card" style="max-width:600px;">
+      <h2>Add Policy</h2>
+      <form method="post" action="/school/policies/add">
+        <div class="form-group">
+          <label class="form-label">Title</label>
+          <input type="text" name="title" placeholder="e.g. Studio Policy 2026" required>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Policy Text</label>
+          <textarea name="body" rows="8" placeholder="Enter the full policy text..." required style="width:100%;padding:8px 11px;border:1.5px solid var(--border);border-radius:8px;font-size:13px;font-family:inherit;"></textarea>
+        </div>
+        <button class="btn" type="submit">➕ Add Policy</button>
+      </form>
+    </div>
+    """
+    return HTMLResponse(school_page("Policies", content, "policies"))
+
+
+@app.post("/school/policies/add")
+async def school_add_policy(request: Request,
+                             title: str = Form(...), body: str = Form(...)):
+    school = _require_school(request)
+    if not school: return RedirectResponse("/school/login", status_code=303)
+    _append_csv(POLICIES_FILE, POLICIES_HEADERS, {
+        "id": secrets.token_hex(8), "school_id": school["school_id"],
+        "title": title.strip(), "body": body.strip(),
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    return RedirectResponse("/school/policies?toast=Policy+added", status_code=303)
+
+
+@app.get("/school/policies/{policy_id}/sigs", response_class=HTMLResponse)
+def policy_signatures(request: Request, policy_id: str):
+    school = _require_school(request)
+    if not school: return RedirectResponse("/school/login", status_code=303)
+    policy = next((p for p in _read_csv(POLICIES_FILE, POLICIES_HEADERS)
+                   if p["id"] == policy_id and p["school_id"] == school["school_id"]), None)
+    if not policy: return RedirectResponse("/school/policies", status_code=303)
+    sigs = [s for s in _read_csv(SIGNATURES_FILE, SIGNATURES_HEADERS)
+            if s["policy_id"] == policy_id]
+    students = get_all_school_students(school["school_id"])
+    signed_ids = {s["student_id"] for s in sigs}
+    rows = ""
+    for stu in students:
+        if stu["student_id"] in signed_ids:
+            sig = next(s for s in sigs if s["student_id"] == stu["student_id"])
+            rows += (f'<tr><td>{stu["name"]}</td>'
+                     f'<td><span class="badge badge-success">✓ Signed {sig["signed_at"][:10]}</span></td></tr>')
+        else:
+            rows += (f'<tr><td>{stu["name"]}</td>'
+                     f'<td><span class="badge badge-danger">Not signed</span></td></tr>')
+    content = f"""
+    <h1>📋 {policy["title"]} — Signatures</h1>
+    <div class="card">
+      <table><thead><tr><th>Student</th><th>Status</th></tr></thead>
+      <tbody>{rows or "<tr><td colspan=2>No students found.</td></tr>"}</tbody></table>
+    </div>
+    <a href="/school/policies" class="btn btn-outline">← Back to Policies</a>
+    """
+    return HTMLResponse(school_page("Policy Signatures", content, "policies"))
+
+
+# ── Policy: parent web signing ─────────────────────────────────────────────────
+@app.get("/sign/{policy_id}", response_class=HTMLResponse)
+def policy_sign_page(request: Request, policy_id: str, code: str = ""):
+    policy = next((p for p in _read_csv(POLICIES_FILE, POLICIES_HEADERS)
+                   if p["id"] == policy_id), None)
+    if not policy:
+        return HTMLResponse("<h2>Policy not found.</h2>", status_code=404)
+    already_signed = ""
+    if code:
+        students = _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
+        student  = next((s for s in students if s.get("access_code") == code
+                         and s["school_id"] == policy["school_id"]), None)
+        if student:
+            existing = next((s for s in _read_csv(SIGNATURES_FILE, SIGNATURES_HEADERS)
+                             if s["policy_id"] == policy_id
+                             and s["student_id"] == student["student_id"]), None)
+            if existing:
+                already_signed = f'<div class="alert alert-success">✓ Already signed on {existing["signed_at"][:10]}.</div>'
+    return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset=UTF-8>
+    <meta name=viewport content="width=device-width,initial-scale=1">
+    <title>Sign Policy — {policy["title"]}</title>
+    <style>
+      body{{font-family:-apple-system,sans-serif;background:#f8faff;padding:24px;max-width:640px;margin:0 auto;}}
+      h1{{font-size:22px;font-weight:800;margin-bottom:8px;color:#1e293b;}}
+      .policy-body{{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:20px;
+                    white-space:pre-wrap;font-size:14px;line-height:1.7;color:#334155;
+                    max-height:340px;overflow-y:auto;margin:16px 0;}}
+      .form-group{{margin-bottom:14px;}}
+      label{{display:block;font-size:12px;font-weight:600;margin-bottom:4px;color:#64748b;}}
+      input{{width:100%;padding:10px 13px;border:1.5px solid #e2e8f0;border-radius:9px;font-size:14px;}}
+      input:focus{{outline:none;border-color:#6366f1;box-shadow:0 0 0 3px rgba(99,102,241,.1);}}
+      .btn{{display:inline-block;padding:12px 28px;background:linear-gradient(135deg,#6366f1,#8b5cf6);
+            color:#fff;border:none;border-radius:10px;font-weight:700;font-size:15px;cursor:pointer;width:100%;}}
+      .alert-success{{background:#d1fae5;color:#065f46;border:1px solid #a7f3d0;
+                      padding:12px 16px;border-radius:9px;margin-bottom:14px;font-weight:600;}}
+    </style></head><body>
+    <h1>📋 {policy["title"]}</h1>
+    <p style="color:#64748b;font-size:14px;">Please read and sign this policy from {policy["school_id"]}.</p>
+    <div class="policy-body">{policy["body"]}</div>
+    {already_signed}
+    <form method="post" action="/sign/{policy_id}">
+      <div class="form-group">
+        <label>Your Student Access Code</label>
+        <input type="text" name="code" value="{code}" placeholder="Enter your access code" required>
+      </div>
+      <button class="btn" type="submit">✍️ I agree &amp; sign</button>
+    </form>
+    </body></html>""")
+
+
+@app.post("/sign/{policy_id}", response_class=HTMLResponse)
+async def policy_sign_post(request: Request, policy_id: str, code: str = Form(...)):
+    policy = next((p for p in _read_csv(POLICIES_FILE, POLICIES_HEADERS)
+                   if p["id"] == policy_id), None)
+    if not policy:
+        return HTMLResponse("<h2>Policy not found.</h2>", status_code=404)
+    students = _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
+    student  = next((s for s in students if s.get("access_code") == code
+                     and s["school_id"] == policy["school_id"]), None)
+    if not student:
+        return HTMLResponse(f"""<!DOCTYPE html><html><body style="font-family:-apple-system,sans-serif;padding:24px;">
+        <div style="background:#fee2e2;color:#991b1b;padding:14px;border-radius:9px;margin-bottom:14px;">
+          Invalid access code. Please check with your teacher.
+        </div>
+        <a href="/sign/{policy_id}" style="color:#6366f1;">← Try again</a>
+        </body></html>""")
+    existing = next((s for s in _read_csv(SIGNATURES_FILE, SIGNATURES_HEADERS)
+                     if s["policy_id"] == policy_id
+                     and s["student_id"] == student["student_id"]), None)
+    if not existing:
+        _append_csv(SIGNATURES_FILE, SIGNATURES_HEADERS, {
+            "id": secrets.token_hex(6), "policy_id": policy_id,
+            "school_id": policy["school_id"],
+            "student_id": student["student_id"],
+            "student_name": student["name"],
+            "signed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    return HTMLResponse(f"""<!DOCTYPE html><html><body style="font-family:-apple-system,sans-serif;padding:24px;max-width:480px;margin:0 auto;text-align:center;">
+    <div style="margin-top:60px;">
+      <div style="font-size:64px;margin-bottom:16px;">✅</div>
+      <h1 style="font-size:22px;font-weight:800;color:#1e293b;margin-bottom:8px;">Signed!</h1>
+      <p style="color:#64748b;">Thank you, {student["name"]}. Your signature has been recorded.</p>
+    </div></body></html>""")
+
+
+# ── Mobile: policy endpoints ───────────────────────────────────────────────────
+@app.get("/api/mobile/parent/policies")
+def mobile_parent_policies(request: Request):
+    student = _parent_auth(request)
+    if not student: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    policies = [p for p in _read_csv(POLICIES_FILE, POLICIES_HEADERS)
+                if p["school_id"] == student["school_id"]]
+    sigs     = _read_csv(SIGNATURES_FILE, SIGNATURES_HEADERS)
+    result   = []
+    for p in policies:
+        signed = any(s["policy_id"] == p["id"] and s["student_id"] == student["student_id"]
+                     for s in sigs)
+        result.append({"id": p["id"], "title": p["title"], "signed": signed,
+                       "sign_url": f"https://music-school-app-hde7.onrender.com/sign/{p['id']}"
+                                   f"?code={student.get('access_code', '')}"})
+    return JSONResponse({"ok": True, "policies": result})
+
+
+# ── Mobile: school billing ─────────────────────────────────────────────────────
+@app.post("/api/mobile/school/billing/checkout")
+async def mobile_school_billing_checkout(request: Request):
+    school = _require_school(request)
+    if not school: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    if not STRIPE_SECRET_KEY:
+        return JSONResponse({"ok": False, "error": "Stripe not configured"}, status_code=503)
+    data     = await request.json()
+    plan     = data.get("plan", "solo")
+    price_id = PLAN_PRICES.get(plan)
+    if not price_id:
+        return JSONResponse({"ok": False, "error": "unknown plan"}, status_code=400)
+    stripe.api_key = STRIPE_SECRET_KEY
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            customer_email=school["owner_email"],
+            metadata={"school_id": school["school_id"], "plan": plan},
+            success_url=f"https://music-school-app-hde7.onrender.com/school/dashboard?toast=Subscription+active",
+            cancel_url=f"https://music-school-app-hde7.onrender.com/school/billing",
+        )
+        return JSONResponse({"ok": True, "url": session.url})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
