@@ -1786,7 +1786,6 @@ SIGNATURES_HEADERS = ["id", "policy_id", "school_id", "student_id",
                       "student_name", "signed_at"]
 
 PLAN_PRICES = {
-    "solo":   os.environ.get("STRIPE_PRICE_SOLO",   ""),   # $15/mo
     "school": os.environ.get("STRIPE_PRICE_SCHOOL", ""),   # $99/mo
 }
 
@@ -1925,10 +1924,9 @@ def school_billing_page(request: Request):
     if not school: return RedirectResponse("/school/login", status_code=303)
     plan = school.get("plan", "none")
     plan_html = {
-        "solo":     '<span class="badge badge-info">Solo — $15/mo</span>',
         "school":   '<span class="badge badge-success">School — $99/mo</span>',
         "inactive": '<span class="badge badge-danger">Inactive</span>',
-    }.get(plan, '<span class="badge badge-muted">No plan</span>')
+    }.get(plan, '<span class="badge badge-muted">No active plan</span>')
 
     content = f"""
     <h1>💳 Billing</h1>
@@ -1937,20 +1935,12 @@ def school_billing_page(request: Request):
       <p style="margin-bottom:16px;">Active plan: {plan_html}</p>
       <hr style="border:none;border-top:1px solid var(--border);margin:18px 0;">
       <h3 style="margin-bottom:14px;">Upgrade / Change Plan</h3>
-      <div style="display:flex;gap:12px;flex-wrap:wrap;">
-        <form method="post" action="/school/billing/checkout">
-          <input type="hidden" name="plan" value="solo">
-          <button class="btn btn-outline" type="submit">Solo — $15/mo<br>
-            <small style="font-weight:400;font-size:11px;">1 teacher, unlimited students</small>
-          </button>
-        </form>
-        <form method="post" action="/school/billing/checkout">
-          <input type="hidden" name="plan" value="school">
-          <button class="btn" type="submit">School — $99/mo<br>
-            <small style="font-weight:400;font-size:11px;">Up to 10 teachers, unlimited students</small>
-          </button>
-        </form>
-      </div>
+      <form method="post" action="/school/billing/checkout">
+        <input type="hidden" name="plan" value="school">
+        <button class="btn" type="submit">Subscribe — $99/mo<br>
+          <small style="font-weight:400;font-size:11px;">Up to 10 teachers · unlimited students</small>
+        </button>
+      </form>
     </div>
     """
     return HTMLResponse(school_page("Billing", content, "billing"))
