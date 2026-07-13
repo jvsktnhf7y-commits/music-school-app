@@ -4,6 +4,32 @@ from fastapi.middleware.cors import CORSMiddleware
 import os, csv, json, secrets, hashlib, time
 from datetime import datetime, timedelta
 
+SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
+SENDGRID_FROM    = os.environ.get("SENDGRID_FROM_EMAIL", "noreply@musicschoolapp.com")
+
+def _send_email(to: str, subject: str, body_html: str) -> bool:
+    if not SENDGRID_API_KEY:
+        print(f"[Email — no key] To: {to} | {subject}")
+        return False
+    try:
+        import urllib.request as _ur
+        payload = json.dumps({
+            "personalizations": [{"to": [{"email": to}]}],
+            "from":    {"email": SENDGRID_FROM},
+            "subject": subject,
+            "content": [{"type": "text/html", "value": body_html}],
+        }).encode()
+        req = _ur.Request(
+            "https://api.sendgrid.com/v3/mail/send", data=payload, method="POST",
+            headers={"Authorization": f"Bearer {SENDGRID_API_KEY}",
+                     "Content-Type": "application/json"},
+        )
+        _ur.urlopen(req, timeout=10)
+        return True
+    except Exception as e:
+        print(f"[Email error] {e}")
+        return False
+
 app = FastAPI(title="Music School App")
 
 app.add_middleware(
@@ -542,9 +568,10 @@ def school_invite_page(request: Request, error: str = ""):
         <input type="text" name="name" placeholder="Jane Smith" required autofocus></div>
       <div class="form-group"><label class="form-label">Email</label>
         <input type="email" name="email" placeholder="teacher@example.com" required></div>
-      <div class="form-group"><label class="form-label">Temporary Password</label>
-        <input type="text" name="password" placeholder="They can change it after first login" required></div>
-      <button type="submit" class="btn">Send Invite</button>
+      <p style="font-size:13px;color:var(--muted);margin-bottom:14px;">
+        A temporary password will be auto-generated and emailed to the teacher.
+      </p>
+      <button type="submit" class="btn">✉️ Send Invite</button>
       <a href="/school/teachers" class="btn btn-outline">Cancel</a>
     </form>
   </div>
@@ -554,10 +581,11 @@ def school_invite_page(request: Request, error: str = ""):
 
 @app.post("/school/teachers/invite")
 async def school_invite_post(request: Request,
-    name: str = Form(...), email: str = Form(...), password: str = Form(...)):
+    name: str = Form(...), email: str = Form(...)):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
-    email = email.strip().lower()
+    email    = email.strip().lower()
+    password = secrets.token_urlsafe(10)
     if get_teacher_by_email(email):
         return RedirectResponse(f"/school/teachers/invite?error=Email+already+registered", status_code=303)
     teacher_id = secrets.token_hex(8)
@@ -570,7 +598,33 @@ async def school_invite_post(request: Request,
         "created_at":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "active":        "true",
     })
-    return RedirectResponse(f"/school/teachers?toast={name.replace(' ','+')}+added", status_code=303)
+    login_url = "https://music-school-app-hde7.onrender.com/teacher/login"
+    _send_email(email, f"You've been added to {school['name']} on Music School App", f"""
+    <div style="font-family:-apple-system,sans-serif;max-width:520px;margin:0 auto;padding:24px;">
+      <div style="background:linear-gradient(135deg,#6366f1,#8b5cf6);border-radius:14px;padding:28px;text-align:center;margin-bottom:24px;">
+        <div style="font-size:36px;margin-bottom:8px;">🎵</div>
+        <h1 style="color:#fff;font-size:22px;font-weight:800;margin:0;">Welcome to {school['name']}!</h1>
+      </div>
+      <p style="color:#334155;font-size:15px;line-height:1.7;">
+        Hi {name.strip()},<br><br>
+        <strong>{school['owner_name']}</strong> has added you as a teacher on <strong>Music School App</strong>.
+        You can log in and start managing your students right away.
+      </p>
+      <div style="background:#f8faff;border:1px solid #e2e8f0;border-radius:12px;padding:18px;margin:20px 0;">
+        <p style="margin:0 0 6px;font-size:13px;color:#64748b;font-weight:600;">YOUR LOGIN DETAILS</p>
+        <p style="margin:4px 0;font-size:14px;color:#1e293b;"><strong>Email:</strong> {email}</p>
+        <p style="margin:4px 0;font-size:14px;color:#1e293b;"><strong>Password:</strong> {password}</p>
+      </div>
+      <a href="{login_url}" style="display:block;text-align:center;background:linear-gradient(135deg,#6366f1,#8b5cf6);
+         color:#fff;padding:14px;border-radius:12px;text-decoration:none;font-weight:700;font-size:15px;margin:20px 0;">
+        Log In Now →
+      </a>
+      <p style="color:#94a3b8;font-size:12px;text-align:center;">
+        Music School App · Please change your password after first login.
+      </p>
+    </div>
+    """)
+    return RedirectResponse(f"/school/teachers?toast={name.strip().replace(' ','+')}+added+%26+emailed", status_code=303)
 
 
 @app.get("/school/teachers/{teacher_id}", response_class=HTMLResponse)
