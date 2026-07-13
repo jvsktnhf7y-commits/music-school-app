@@ -158,23 +158,6 @@ _init_csv(STUDENTS_FILE, STUDENTS_HEADERS)
 _init_csv(LEDGER_FILE,   LEDGER_HEADERS)
 _init_csv(NOTES_FILE,    NOTES_HEADERS)
 
-# Migrate schools CSV: add trial_ends / is_subscribed for existing rows
-def _migrate_schools():
-    if not os.path.exists(SCHOOLS_FILE):
-        return
-    with open(SCHOOLS_FILE, "r") as f:
-        r = csv.DictReader(f)
-        fields = list(r.fieldnames or [])
-        rows   = [dict(row) for row in r]
-    if not set(SCHOOLS_HEADERS).issubset(set(fields)):
-        for row in rows:
-            row.setdefault("trial_ends",    "")
-            row.setdefault("is_subscribed", "true")  # existing schools grandfathered
-        _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, rows)
-
-_migrate_schools()
-
-
 def _read_csv(path, headers) -> list[dict]:
     if not os.path.exists(path):
         return []
@@ -195,6 +178,21 @@ def _append_csv(path, headers, row: dict):
         csv.DictWriter(f, fieldnames=headers).writerow(
             {k: row.get(k, "") for k in headers}
         )
+
+def _migrate_schools():
+    if not os.path.exists(SCHOOLS_FILE):
+        return
+    with open(SCHOOLS_FILE, "r") as f:
+        r      = csv.DictReader(f)
+        fields = list(r.fieldnames or [])
+        rows   = [dict(row) for row in r]
+    if not set(SCHOOLS_HEADERS).issubset(set(fields)):
+        for row in rows:
+            row.setdefault("trial_ends",    "")
+            row.setdefault("is_subscribed", "true")
+        _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, rows)
+
+_migrate_schools()
 
 
 def _hash(s: str) -> str:
