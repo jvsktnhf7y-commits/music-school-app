@@ -206,7 +206,7 @@ def get_teacher(teacher_id: str) -> dict | None:
 
 def get_teacher_by_email(email: str) -> dict | None:
     return next((t for t in _read_csv(TEACHERS_FILE, TEACHERS_HEADERS)
-                 if t["email"] == email), None)
+                 if t["email"] == email and t.get("active", "true") == "true"), None)
 
 
 # ── Student helpers ────────────────────────────────────────────────────────────
