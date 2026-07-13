@@ -304,12 +304,13 @@ def school_page(title, content, active):
 
 def teacher_page(title, content, active):
     return _page(title, content, active, [
-        ("dashboard", "/teacher/dashboard", "🏠", "Dashboard"),
-        ("students",  "/teacher/students",  "👥", "My Students"),
-        ("schedule",  "/teacher/schedule",  "📅", "Schedule"),
-        ("payments",  "/teacher/payments",  "💳", "Payments"),
-        ("notes",     "/teacher/notes",     "📝", "Notes"),
-        ("analytics", "/teacher/analytics", "📊", "Analytics"),
+        ("dashboard",  "/teacher/dashboard",          "🏠", "Dashboard"),
+        ("students",   "/teacher/students",           "👥", "My Students"),
+        ("notes",      "/teacher/notes",              "📝", "Notes"),
+        ("attendance", "/teacher/attendance-history", "📋", "Attendance"),
+        ("payments",   "/teacher/payments",           "💳", "Payments"),
+        ("analytics",  "/teacher/analytics",          "📊", "Analytics"),
+        ("schedule",   "/teacher/schedule",           "📅", "Schedule"),
     ], "/teacher/logout")
 
 
@@ -1036,20 +1037,39 @@ def teacher_student_detail(student_id: str, request: Request, toast: str = ""):
         for n in notes[:5]
     ) or '<p style="color:var(--muted);font-size:13px;">No notes yet.</p>'
 
+    att = [r for r in ledger if r.get("status") in ("Confirmed","Missed","Cancelled")]
+    confirmed  = len([r for r in att if r["status"] == "Confirmed"])
+    missed     = len([r for r in att if r["status"] == "Missed"])
+    cancelled  = len([r for r in att if r["status"] == "Cancelled"])
+    att_pct    = f"{confirmed/(confirmed+missed)*100:.0f}%" if (confirmed+missed) > 0 else "—"
+    credits    = sum(1 for r in att if r["status"] == "Cancelled")
+
     t_html = f'<div class="alert alert-success">{toast}</div>' if toast else ""
     content = f"""
 {t_html}
-<div style="display:flex;align-items:center;gap:12px;margin-bottom:20px;">
-  <a href="/teacher/students" style="color:var(--muted);text-decoration:none;">← Students</a>
-  <h1>{student['name']}</h1>
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:10px;">
+  <div style="display:flex;align-items:center;gap:12px;">
+    <a href="/teacher/students" style="color:var(--muted);text-decoration:none;">← Students</a>
+    <h1>{student['name']}</h1>
+  </div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;">
+    <a href="/teacher/students/{student_id}/edit" class="btn btn-outline btn-sm">✏️ Edit</a>
+    <a href="/teacher/students/{student_id}/report" class="btn btn-outline btn-sm" target="_blank">🖨️ Report</a>
+  </div>
 </div>
 <div class="stats-row">
   <div class="stat-card"><div class="stat-icon" style="background:#d1fae5;">💰</div>
     <div class="stat-val" style="color:{"var(--success)" if float(student.get("prepaid",0))>0 else "var(--danger)"};">${float(student.get("prepaid",0)):.2f}</div>
     <div class="stat-lbl">Prepaid Balance</div></div>
-  <div class="stat-card"><div class="stat-icon" style="background:#fef3c7;">📋</div>
-    <div class="stat-val">${total_charged:.2f}</div><div class="stat-lbl">Total Charged</div></div>
-  <div class="stat-card"><div class="stat-icon" style="background:#ede9fe;">💵</div>
+  <div class="stat-card"><div class="stat-icon" style="background:#dbeafe;">✅</div>
+    <div class="stat-val">{confirmed}</div><div class="stat-lbl">Confirmed</div></div>
+  <div class="stat-card"><div class="stat-icon" style="background:#fee2e2;">❌</div>
+    <div class="stat-val">{missed}</div><div class="stat-lbl">Missed</div></div>
+  <div class="stat-card"><div class="stat-icon" style="background:#fef3c7;">🎟️</div>
+    <div class="stat-val">{credits}</div><div class="stat-lbl">Make-up Credits</div></div>
+  <div class="stat-card"><div class="stat-icon" style="background:#ede9fe;">📊</div>
+    <div class="stat-val">{att_pct}</div><div class="stat-lbl">Attendance %</div></div>
+  <div class="stat-card"><div class="stat-icon" style="background:#fef3c7;">💵</div>
     <div class="stat-val">${float(student.get("rate",50)):.2f}</div><div class="stat-lbl">Rate / Lesson</div></div>
 </div>
 <div class="two-col">
@@ -1059,13 +1079,24 @@ def teacher_student_detail(student_id: str, request: Request, toast: str = ""):
     {notes_html}
   </div>
   <div class="card">
-    <div class="card-title" style="margin-bottom:14px;">Actions</div>
-    <form action="/teacher/students/{student_id}/payment" method="post" style="display:flex;gap:8px;margin-bottom:12px;">
+    <div class="card-title" style="margin-bottom:14px;">Record Attendance</div>
+    <form action="/teacher/students/{student_id}/attendance" method="post" style="margin-bottom:16px;">
+      <div class="form-group"><label class="form-label">Date</label>
+        <input type="date" name="date" value="{datetime.now().strftime('%Y-%m-%d')}" required></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button name="status" value="Confirmed" class="btn btn-success btn-sm">✅ Confirmed</button>
+        <button name="status" value="Missed" class="btn btn-sm" style="background:var(--danger);">❌ Missed</button>
+        <button name="status" value="Cancelled" class="btn btn-warning btn-sm">🎟️ Cancelled</button>
+      </div>
+    </form>
+    <hr style="border:none;border-top:1px solid var(--border);margin:14px 0;">
+    <div class="card-title" style="margin-bottom:10px;">Payment</div>
+    <form action="/teacher/students/{student_id}/payment" method="post" style="display:flex;gap:8px;margin-bottom:10px;">
       <input type="number" name="amount" placeholder="Amount" step="0.01" min="0" style="flex:1;">
       <button type="submit" class="btn btn-success btn-sm">+ Payment</button>
     </form>
     <form action="/teacher/students/{student_id}/charge" method="post" style="display:flex;gap:8px;">
-      <input type="number" name="amount" placeholder="Charge" step="0.01" min="0" style="flex:1;" value="{float(student.get("rate",50)):.2f}">
+      <input type="number" name="amount" placeholder="Charge" step="0.01" min="0" style="flex:1;" value="{float(student.get('rate',50)):.2f}">
       <button type="submit" class="btn btn-sm" style="background:var(--danger);">- Charge</button>
     </form>
   </div>
@@ -1110,6 +1141,187 @@ async def teacher_charge_student(student_id: str, request: Request, amount: floa
         "status": "Lesson Charged", "amount": f"-{amount:.2f}", "notes": "",
     })
     return RedirectResponse(f"/teacher/students/{student_id}?toast=Lesson+charged", status_code=303)
+
+
+@app.post("/teacher/students/{student_id}/attendance")
+async def teacher_record_attendance(student_id: str, request: Request,
+    date: str = Form(...), status: str = Form(...)):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    student = get_student(student_id)
+    if not student: return RedirectResponse("/teacher/students", status_code=303)
+    rate = float(student.get("rate", 50))
+    # Confirmed = charge lesson; Cancelled = give make-up credit (no charge); Missed = charge
+    amount = 0.0
+    if status in ("Confirmed", "Missed"):
+        amount = -rate
+        rows = _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
+        for r in rows:
+            if r["student_id"] == student_id:
+                r["prepaid"] = f"{float(r.get('prepaid',0)) - rate:.2f}"
+        _write_csv(STUDENTS_FILE, STUDENTS_HEADERS, rows)
+    _append_csv(LEDGER_FILE, LEDGER_HEADERS, {
+        "id": secrets.token_hex(6), "school_id": teacher["school_id"],
+        "teacher_id": teacher["teacher_id"], "student_id": student_id,
+        "student_name": student.get("name",""),
+        "date": date, "status": status,
+        "amount": f"{amount:.2f}" if amount else "0.00", "notes": "",
+    })
+    return RedirectResponse(f"/teacher/students/{student_id}?toast={status}+recorded", status_code=303)
+
+
+@app.get("/teacher/students/{student_id}/edit", response_class=HTMLResponse)
+def teacher_edit_student_page(student_id: str, request: Request):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    student = get_student(student_id)
+    if not student or student["teacher_id"] != teacher["teacher_id"]:
+        return RedirectResponse("/teacher/students", status_code=303)
+    content = f"""
+<div style="max-width:480px;">
+  <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px;">
+    <a href="/teacher/students/{student_id}" style="color:var(--muted);text-decoration:none;">← {student['name']}</a>
+    <h1>Edit Student</h1>
+  </div>
+  <div class="card">
+    <form action="/teacher/students/{student_id}/edit" method="post">
+      <div class="form-group"><label class="form-label">Student Name</label>
+        <input type="text" name="name" value="{student['name']}" required autofocus></div>
+      <div class="form-group"><label class="form-label">Lesson Rate ($/lesson)</label>
+        <input type="number" name="rate" value="{float(student.get('rate',50)):.2f}" step="0.01" min="0" required></div>
+      <div class="form-group"><label class="form-label">Parent Email</label>
+        <input type="email" name="parent_email" value="{student.get('parent_email','')}"></div>
+      <div class="form-group"><label class="form-label">Parent Access Code</label>
+        <input type="text" name="parent_code" value="{student.get('parent_code','')}">
+        <small style="color:var(--muted);">Parents use this to log in to the parent portal.</small></div>
+      <button type="submit" class="btn">Save Changes</button>
+      <a href="/teacher/students/{student_id}" class="btn btn-outline">Cancel</a>
+    </form>
+  </div>
+</div>"""
+    return HTMLResponse(teacher_page("Edit Student", content, "students"))
+
+
+@app.post("/teacher/students/{student_id}/edit")
+async def teacher_edit_student_post(student_id: str, request: Request,
+    name: str = Form(...), rate: float = Form(...),
+    parent_email: str = Form(""), parent_code: str = Form("")):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    rows = _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
+    for r in rows:
+        if r["student_id"] == student_id and r["teacher_id"] == teacher["teacher_id"]:
+            r["name"]         = name.strip()
+            r["rate"]         = f"{rate:.2f}"
+            r["parent_email"] = parent_email.strip().lower()
+            r["parent_code"]  = parent_code.strip()
+    _write_csv(STUDENTS_FILE, STUDENTS_HEADERS, rows)
+    return RedirectResponse(f"/teacher/students/{student_id}?toast=Student+updated", status_code=303)
+
+
+@app.get("/teacher/students/{student_id}/report", response_class=HTMLResponse)
+def teacher_student_report(student_id: str, request: Request):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    student = get_student(student_id)
+    if not student or student["teacher_id"] != teacher["teacher_id"]:
+        return RedirectResponse("/teacher/students", status_code=303)
+    notes  = sorted([r for r in _read_csv(NOTES_FILE, NOTES_HEADERS)
+                     if r["student_id"] == student_id],
+                    key=lambda r: r.get("date",""), reverse=True)
+    ledger = [r for r in _read_csv(LEDGER_FILE, LEDGER_HEADERS) if r["student_id"] == student_id]
+    att    = [r for r in ledger if r.get("status") in ("Confirmed","Missed","Cancelled")]
+    confirmed = len([r for r in att if r["status"] == "Confirmed"])
+    missed    = len([r for r in att if r["status"] == "Missed"])
+    att_pct   = f"{confirmed/(confirmed+missed)*100:.0f}%" if (confirmed+missed) > 0 else "—"
+    notes_html = "".join(f"""
+    <tr>
+      <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;color:#64748b;white-space:nowrap;">{n.get('date','')}</td>
+      <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;">{n.get('notes','')}</td>
+      <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;color:#10b981;">{n.get('assignment','')}</td>
+    </tr>""" for n in notes[:20]) or '<tr><td colspan="3" style="padding:12px;color:#94a3b8;">No notes recorded.</td></tr>'
+    school = next((s for s in _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
+                   if s["school_id"] == teacher["school_id"]), {})
+    return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset=UTF-8>
+    <title>Progress Report — {student['name']}</title>
+    <style>
+      body{{font-family:-apple-system,sans-serif;max-width:760px;margin:0 auto;padding:32px;color:#1e293b;}}
+      h1{{font-size:24px;font-weight:800;margin:0;}}
+      .header{{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:28px;padding-bottom:16px;border-bottom:2px solid #6366f1;}}
+      .school{{font-size:13px;color:#64748b;text-align:right;}}
+      .stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:28px;}}
+      .stat{{background:#f8faff;border:1px solid #e2e8f0;border-radius:10px;padding:14px;text-align:center;}}
+      .stat-val{{font-size:22px;font-weight:800;color:#6366f1;}}
+      .stat-lbl{{font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-top:4px;}}
+      h2{{font-size:15px;font-weight:700;margin:0 0 12px;color:#1e293b;}}
+      table{{width:100%;border-collapse:collapse;font-size:13px;}}
+      thead th{{background:#f1f5f9;padding:8px 12px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:#64748b;}}
+      .print-btn{{position:fixed;bottom:24px;right:24px;background:#6366f1;color:#fff;padding:12px 24px;border-radius:10px;border:none;font-size:14px;font-weight:700;cursor:pointer;}}
+      @media print{{.print-btn{{display:none;}}}}
+    </style></head><body>
+    <div class="header">
+      <div>
+        <h1>📋 Progress Report</h1>
+        <div style="font-size:20px;font-weight:700;color:#6366f1;margin-top:6px;">{student['name']}</div>
+        <div style="font-size:13px;color:#64748b;margin-top:4px;">Teacher: {teacher.get('name','')} · Generated {datetime.now().strftime('%B %d, %Y')}</div>
+      </div>
+      <div class="school"><strong>{school.get('name','')}</strong><br>${float(student.get('rate',50)):.2f}/lesson</div>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="stat-val">{confirmed}</div><div class="stat-lbl">Confirmed</div></div>
+      <div class="stat"><div class="stat-val">{missed}</div><div class="stat-lbl">Missed</div></div>
+      <div class="stat"><div class="stat-val">{att_pct}</div><div class="stat-lbl">Attendance</div></div>
+      <div class="stat"><div class="stat-val" style="color:{"#10b981" if float(student.get("prepaid",0))>=0 else "#ef4444"};">${float(student.get('prepaid',0)):.2f}</div><div class="stat-lbl">Balance</div></div>
+    </div>
+    <h2>📝 Lesson Notes</h2>
+    <table><thead><tr><th>Date</th><th>Notes</th><th>Assignment</th></tr></thead>
+    <tbody>{notes_html}</tbody></table>
+    <button class="print-btn" onclick="window.print()">🖨️ Print</button>
+    </body></html>""")
+
+
+@app.get("/teacher/attendance-history", response_class=HTMLResponse)
+def teacher_attendance_history(request: Request, student_id: str = "", month: str = ""):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    students = get_students(teacher["teacher_id"])
+    ledger   = [r for r in _read_csv(LEDGER_FILE, LEDGER_HEADERS)
+                if r["teacher_id"] == teacher["teacher_id"]
+                and r.get("status") in ("Confirmed","Missed","Cancelled")]
+    if student_id:
+        ledger = [r for r in ledger if r["student_id"] == student_id]
+    if month:
+        ledger = [r for r in ledger if r.get("date","").startswith(month)]
+    ledger.sort(key=lambda r: r.get("date",""), reverse=True)
+
+    student_opts = "".join(
+        f'<option value="{s["student_id"]}" {"selected" if s["student_id"]==student_id else ""}>{s["name"]}</option>'
+        for s in students)
+    rows = "".join(
+        f'<tr><td>{r.get("date","")}</td><td><strong>{r.get("student_name","")}</strong></td>'
+        f'<td><span class="badge {"badge-success" if r["status"]=="Confirmed" else "badge-danger" if r["status"]=="Missed" else "badge-warning"}">{r["status"]}</span></td></tr>'
+        for r in ledger[:100]
+    ) or '<tr><td colspan="3" style="text-align:center;color:var(--muted);padding:24px;">No records found.</td></tr>'
+    content = f"""
+<h1 style="margin-bottom:18px;">📋 Attendance History</h1>
+<div class="card" style="margin-bottom:18px;">
+  <form method="get" action="/teacher/attendance-history" style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;">
+    <div class="form-group" style="margin:0;flex:1;min-width:160px;">
+      <label class="form-label">Student</label>
+      <select name="student_id"><option value="">All Students</option>{student_opts}</select>
+    </div>
+    <div class="form-group" style="margin:0;flex:1;min-width:140px;">
+      <label class="form-label">Month</label>
+      <input type="month" name="month" value="{month}">
+    </div>
+    <button type="submit" class="btn btn-sm">Filter</button>
+  </form>
+</div>
+<div class="card">
+  <table><thead><tr><th>Date</th><th>Student</th><th>Status</th></tr></thead>
+  <tbody>{rows}</tbody></table>
+</div>"""
+    return HTMLResponse(teacher_page("Attendance History", content, "attendance"))
 
 
 # ── Teacher: Notes ─────────────────────────────────────────────────────────────
