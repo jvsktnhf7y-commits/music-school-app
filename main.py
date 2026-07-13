@@ -615,10 +615,22 @@ async def school_invite_post(request: Request,
         <p style="margin:4px 0;font-size:14px;color:#1e293b;"><strong>Email:</strong> {email}</p>
         <p style="margin:4px 0;font-size:14px;color:#1e293b;"><strong>Password:</strong> {password}</p>
       </div>
-      <a href="{login_url}" style="display:block;text-align:center;background:linear-gradient(135deg,#6366f1,#8b5cf6);
-         color:#fff;padding:14px;border-radius:12px;text-decoration:none;font-weight:700;font-size:15px;margin:20px 0;">
-        Log In Now →
-      </a>
+      <table width="100%" cellpadding="0" cellspacing="0" style="margin:20px 0;">
+        <tr>
+          <td align="center">
+            <a href="{login_url}" target="_blank"
+               style="background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#ffffff;
+                      padding:14px 32px;border-radius:12px;text-decoration:none;
+                      font-weight:700;font-size:15px;display:inline-block;
+                      mso-padding-alt:0;border:1px solid #6366f1;">
+              Log In Now &rarr;
+            </a>
+          </td>
+        </tr>
+      </table>
+      <p style="text-align:center;font-size:13px;color:#64748b;">
+        Or copy this link: <a href="{login_url}" style="color:#6366f1;">{login_url}</a>
+      </p>
       <p style="color:#94a3b8;font-size:12px;text-align:center;">
         Music School App · Please change your password after first login.
       </p>
