@@ -135,7 +135,7 @@ LEDGER_FILE   = "/data/ledger.csv"
 NOTES_FILE    = "/data/notes.csv"
 
 SCHOOLS_HEADERS  = ["school_id", "name", "owner_email", "owner_name", "password_hash",
-                    "plan", "created_at", "active"]
+                    "plan", "created_at", "active", "trial_ends", "is_subscribed"]
 TEACHERS_HEADERS = ["teacher_id", "school_id", "name", "email", "password_hash",
                     "created_at", "active"]
 STUDENTS_HEADERS = ["student_id", "school_id", "teacher_id", "name", "rate",
@@ -157,6 +157,22 @@ _init_csv(TEACHERS_FILE, TEACHERS_HEADERS)
 _init_csv(STUDENTS_FILE, STUDENTS_HEADERS)
 _init_csv(LEDGER_FILE,   LEDGER_HEADERS)
 _init_csv(NOTES_FILE,    NOTES_HEADERS)
+
+# Migrate schools CSV: add trial_ends / is_subscribed for existing rows
+def _migrate_schools():
+    if not os.path.exists(SCHOOLS_FILE):
+        return
+    with open(SCHOOLS_FILE, "r") as f:
+        r = csv.DictReader(f)
+        fields = list(r.fieldnames or [])
+        rows   = [dict(row) for row in r]
+    if not set(SCHOOLS_HEADERS).issubset(set(fields)):
+        for row in rows:
+            row.setdefault("trial_ends",    "")
+            row.setdefault("is_subscribed", "true")  # existing schools grandfathered
+        _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, rows)
+
+_migrate_schools()
 
 
 def _read_csv(path, headers) -> list[dict]:
@@ -193,6 +209,34 @@ def get_school(school_id: str) -> dict | None:
 def get_school_by_email(email: str) -> dict | None:
     return next((s for s in _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
                  if s["owner_email"] == email), None)
+
+def _update_school(school_id: str, **kwargs):
+    rows = _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
+    for r in rows:
+        if r["school_id"] == school_id:
+            r.update(kwargs)
+    _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, rows)
+
+def school_has_access(school: dict) -> tuple[bool, str]:
+    if school.get("is_subscribed") == "true":
+        return True, "subscribed"
+    trial_ends = school.get("trial_ends", "")
+    if trial_ends:
+        try:
+            if datetime.strptime(trial_ends, "%Y-%m-%d").date() >= datetime.now().date():
+                return True, "trial"
+        except ValueError:
+            pass
+    return False, "expired"
+
+def school_trial_days(school: dict) -> int:
+    trial_ends = school.get("trial_ends", "")
+    if not trial_ends:
+        return 0
+    try:
+        return max(0, (datetime.strptime(trial_ends, "%Y-%m-%d").date() - datetime.now().date()).days)
+    except ValueError:
+        return 0
 
 
 # ── Teacher helpers ────────────────────────────────────────────────────────────
@@ -297,7 +341,6 @@ def school_page(title, content, active):
         ("students",  "/school/students",  "👥", "All Students"),
         ("analytics", "/school/analytics", "📊", "Analytics"),
         ("policies",  "/school/policies",  "📋", "Policies"),
-        ("billing",   "/school/billing",   "💳", "Billing"),
         ("settings",  "/school/settings",  "⚙️",  "Settings"),
     ], "/school/logout")
 
@@ -419,18 +462,21 @@ async def school_signup_post(
     email = email.strip().lower()
     if get_school_by_email(email):
         return RedirectResponse(f"/school/signup?error=Email+already+registered", status_code=303)
-    school_id = secrets.token_hex(8)
+    school_id  = secrets.token_hex(8)
+    trial_ends = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
     _append_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, {
-        "school_id":    school_id,
-        "name":         school_name.strip(),
-        "owner_email":  email,
-        "owner_name":   owner_name.strip(),
+        "school_id":     school_id,
+        "name":          school_name.strip(),
+        "owner_email":   email,
+        "owner_name":    owner_name.strip(),
         "password_hash": _hash(password),
-        "plan":         "starter",
-        "created_at":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "active":       "true",
+        "plan":          "trial",
+        "created_at":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "active":        "true",
+        "trial_ends":    trial_ends,
+        "is_subscribed": "false",
     })
-    resp = RedirectResponse("/school/dashboard?toast=Welcome!+Your+school+is+ready.", status_code=303)
+    resp = RedirectResponse("/school/subscribe", status_code=303)
     resp.set_cookie("school_id", school_id, httponly=True, max_age=86400 * 30)
     return resp
 
@@ -475,12 +521,133 @@ def _require_school(request: Request) -> dict | None:
     sid = request.cookies.get("school_id", "")
     return get_school(sid) if sid else None
 
+def _school_access_response(school: dict) -> RedirectResponse | None:
+    """Returns a redirect if school lacks access, else None."""
+    has_access, _ = school_has_access(school)
+    if not has_access:
+        return RedirectResponse("/school/subscribe", status_code=303)
+    return None
+
+
+@app.get("/school/subscribe", response_class=HTMLResponse)
+def school_subscribe_page(request: Request, success: str = "", cancelled: str = ""):
+    school = _require_school(request)
+    if not school:
+        return RedirectResponse("/school/login", status_code=303)
+
+    if success:
+        if STRIPE_SECRET_KEY:
+            try:
+                stripe.api_key = STRIPE_SECRET_KEY
+                sess = stripe.checkout.Session.retrieve(success)
+                if sess.get("payment_status") in ("paid", "no_payment_required") or sess.get("status") == "complete":
+                    _update_school(school["school_id"], is_subscribed="true", plan="school")
+            except Exception:
+                pass
+        return RedirectResponse("/school/dashboard?toast=Welcome%21+Your+subscription+is+active.", status_code=303)
+
+    has_access, reason = school_has_access(school)
+    if reason == "subscribed":
+        return RedirectResponse("/school/dashboard", status_code=303)
+
+    days_left = school_trial_days(school)
+
+    trial_html = ""
+    if reason == "trial" and days_left > 0:
+        trial_html = (
+            f'<div style="background:#1e3a2e;border:1px solid #166534;border-radius:12px;'
+            f'padding:14px 18px;margin-bottom:20px;color:#86efac;font-size:14px;font-weight:600;">'
+            f'✅ Free trial active — <strong>{days_left} day{"s" if days_left != 1 else ""} remaining</strong>. '
+            f'Add a card now to keep access after your trial ends.</div>'
+        )
+
+    expired_html = "" if reason == "trial" else (
+        '<div style="background:#3b1515;border:1px solid #7f1d1d;border-radius:10px;padding:12px 16px;'
+        'margin-bottom:20px;color:#fca5a5;font-size:14px;font-weight:600;">'
+        '⏰ Your free trial has ended. Subscribe to continue.</div>'
+    )
+
+    cancelled_html = (
+        '<div style="background:#3b1515;border:1px solid #7f1d1d;border-radius:10px;padding:12px 16px;'
+        'margin-bottom:16px;color:#fca5a5;font-size:13px;">Checkout cancelled — no charge was made.</div>'
+        if cancelled else ""
+    )
+
+    stripe_btn = (
+        '<form action="/school/billing/checkout" method="post" style="margin:0;">'
+        '<input type="hidden" name="plan" value="school">'
+        '<button type="submit" style="width:100%;padding:16px;background:linear-gradient(135deg,#6366f1,#8b5cf6);'
+        'color:#fff;border:none;border-radius:12px;font-size:16px;font-weight:700;cursor:pointer;">'
+        '🎵 Start Free Trial — $99/month after 30 days</button></form>'
+    ) if STRIPE_SECRET_KEY else (
+        '<div style="background:#1e293b;border-radius:12px;padding:14px;color:#94a3b8;font-size:13px;text-align:center;">'
+        'Payment system not configured yet.</div>'
+    )
+
+    content = f"""
+<div style="max-width:480px;margin:80px auto;padding:0 16px;">
+  <div style="text-align:center;margin-bottom:32px;">
+    <div style="font-size:48px;margin-bottom:12px;">🏫</div>
+    <h1 style="font-size:26px;font-weight:800;color:#f0f4ff;margin:0 0 6px;">Music School App</h1>
+    <p style="color:#64748b;font-size:15px;margin:0;">Multi-teacher school management platform.</p>
+  </div>
+  <div style="background:#1e293b;border:1px solid #2e3f5c;border-radius:16px;padding:28px;">
+    {cancelled_html}{expired_html}{trial_html}
+    <div style="margin-bottom:22px;">
+      <div style="font-size:13px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;">What's included</div>
+      {"".join(f'<div style="display:flex;align-items:center;gap:10px;padding:7px 0;font-size:14px;color:#e2e8f0;">✅ {f}</div>' for f in [
+        'Unlimited teachers & students',
+        'Per-teacher lesson & attendance tracking',
+        'Parent & student portals',
+        'School-wide analytics',
+        'Policy management & digital signing',
+        'Automated billing & invoicing',
+        'Push notifications',
+      ])}
+    </div>
+    <div style="border-top:1px solid #2e3f5c;padding-top:20px;">
+      {stripe_btn}
+      <p style="text-align:center;font-size:12px;color:#64748b;margin-top:10px;">
+        Card required · No charge for 30 days · Cancel anytime
+      </p>
+    </div>
+  </div>
+  <div style="text-align:center;margin-top:16px;">
+    <a href="/school/logout" style="color:#475569;font-size:13px;text-decoration:none;">Log out</a>
+  </div>
+</div>"""
+    return HTMLResponse(f"""<!DOCTYPE html><html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Subscribe — Music School App</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
+</head><body style="background:#0f172a;min-height:100vh;">{content}</body></html>""")
+
 
 @app.get("/school/dashboard", response_class=HTMLResponse)
 def school_dashboard(request: Request):
     school = _require_school(request)
     if not school:
         return RedirectResponse("/school/login", status_code=303)
+
+    gate = _school_access_response(school)
+    if gate: return gate
+
+    _, reason = school_has_access(school)
+    days_left  = school_trial_days(school)
+    trial_banner = ""
+    if reason == "trial" and days_left <= 10:
+        color = "#f59e0b" if days_left > 5 else "#ef4444"
+        trial_banner = (
+            f'<div style="background:#1c1410;border:1px solid {color};border-radius:10px;'
+            f'padding:12px 16px;margin-bottom:16px;display:flex;align-items:center;'
+            f'justify-content:space-between;flex-wrap:wrap;gap:10px;">'
+            f'<span style="color:{color};font-size:14px;font-weight:600;">'
+            f'⏰ Free trial ends in <strong>{days_left} day{"s" if days_left != 1 else ""}</strong>.</span>'
+            f'<a href="/school/subscribe" style="padding:6px 14px;background:#6366f1;color:#fff;'
+            f'border-radius:8px;font-size:13px;font-weight:700;text-decoration:none;">Add Card Now</a>'
+            f'</div>'
+        )
 
     teachers = get_teachers(school["school_id"])
     students = get_all_school_students(school["school_id"])
@@ -516,6 +683,7 @@ def school_dashboard(request: Request):
     <tbody>{teacher_rows}</tbody>
   </table>
 </div>"""
+    content = trial_banner + content
     return HTMLResponse(school_page("Dashboard", content, "dashboard"))
 
 
@@ -524,6 +692,8 @@ def school_dashboard(request: Request):
 def school_teachers(request: Request):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
 
     teachers = get_teachers(school["school_id"])
     students = get_all_school_students(school["school_id"])
@@ -558,6 +728,8 @@ def school_teachers(request: Request):
 def school_invite_page(request: Request, error: str = ""):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
     err = f'<div class="alert alert-danger">{error}</div>' if error else ""
     content = f"""
 <div style="max-width:480px;">
@@ -585,6 +757,8 @@ async def school_invite_post(request: Request,
     name: str = Form(...), email: str = Form(...)):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
     email    = email.strip().lower()
     password = secrets.token_urlsafe(10)
     if get_teacher_by_email(email):
@@ -644,6 +818,8 @@ async def school_invite_post(request: Request,
 def school_teacher_detail(teacher_id: str, request: Request):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
     teacher  = get_teacher(teacher_id)
     if not teacher or teacher["school_id"] != school["school_id"]:
         return RedirectResponse("/school/teachers", status_code=303)
@@ -681,6 +857,8 @@ def school_teacher_detail(teacher_id: str, request: Request):
 def school_remove_teacher(teacher_id: str, request: Request):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
     rows = _read_csv(TEACHERS_FILE, TEACHERS_HEADERS)
     for r in rows:
         if r["teacher_id"] == teacher_id and r["school_id"] == school["school_id"]:
@@ -694,6 +872,8 @@ def school_remove_teacher(teacher_id: str, request: Request):
 def school_students(request: Request):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
     students = get_all_school_students(school["school_id"])
     teachers = {t["teacher_id"]: t["name"] for t in get_teachers(school["school_id"])}
 
@@ -722,6 +902,8 @@ def school_students(request: Request):
 def school_analytics(request: Request):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
     sid      = school["school_id"]
     teachers = get_teachers(sid)
     students = get_all_school_students(sid)
@@ -788,11 +970,35 @@ new Chart(document.getElementById('chart'),{{type:'bar',data:{{labels:D.labels,d
 def school_settings(request: Request, toast: str = ""):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
     t = f'<div class="alert alert-success">{toast}</div>' if toast else ""
+    has_access, reason = school_has_access(school)
+    days_left = school_trial_days(school)
+    if reason == "subscribed":
+        billing_status = '<span style="color:#10b981;font-weight:700;">✅ Active subscription — $99/month</span>'
+        billing_action = '<a href="/school/billing" class="btn btn-outline btn-sm">Manage Subscription</a>'
+    elif reason == "trial":
+        billing_status = f'<span style="color:#f59e0b;font-weight:700;">🕐 Free trial — {days_left} day{"s" if days_left != 1 else ""} left</span>'
+        billing_action = '<a href="/school/subscribe" class="btn btn-sm" style="background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border:none;">Add Card — $99/mo after trial</a>'
+    else:
+        billing_status = '<span style="color:#ef4444;font-weight:700;">⏰ Trial expired</span>'
+        billing_action = '<a href="/school/subscribe" class="btn btn-sm" style="background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border:none;">Subscribe — $99/mo</a>'
+
     content = f"""
 <div style="max-width:480px;">
   <h1 style="margin-bottom:20px;">Settings</h1>
   {t}
+  <div class="card" style="margin-bottom:16px;">
+    <h3 style="margin-bottom:16px;">💳 Billing</h3>
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
+      <div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:4px;">Current plan</div>
+        {billing_status}
+      </div>
+      {billing_action}
+    </div>
+  </div>
   <div class="card">
     <h3 style="margin-bottom:16px;">School Info</h3>
     <form action="/school/settings" method="post">
@@ -822,6 +1028,8 @@ async def school_settings_post(request: Request,
     school_name: str = Form(...), owner_name: str = Form(...)):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
     rows = _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
     for r in rows:
         if r["school_id"] == school["school_id"]:
@@ -836,6 +1044,8 @@ async def school_password_post(request: Request,
     current_password: str = Form(...), new_password: str = Form(...)):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
     if school["password_hash"] != _hash(current_password):
         return RedirectResponse("/school/settings?toast=Incorrect+current+password", status_code=303)
     rows = _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
@@ -2169,27 +2379,24 @@ async def billing_webhook(request: Request):
                           "customer.subscription.updated"):
         meta      = event["data"]["object"].get("metadata", {})
         school_id = meta.get("school_id")
-        plan      = meta.get("plan", "solo")
+        plan      = meta.get("plan", "school")
         if school_id:
             schools = _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
-            updated = False
             for s in schools:
                 if s["school_id"] == school_id:
-                    s["plan"] = plan
-                    updated = True
-            if updated:
-                _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, schools)
+                    s["plan"]          = plan
+                    s["is_subscribed"] = "true"
+            _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, schools)
 
     elif event["type"] == "customer.subscription.deleted":
-        sub       = event["data"]["object"]
-        # find school by stripe customer — we store customer_id in metadata at checkout
-        meta      = sub.get("metadata", {})
+        meta      = event["data"]["object"].get("metadata", {})
         school_id = meta.get("school_id")
         if school_id:
             schools = _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
             for s in schools:
                 if s["school_id"] == school_id:
-                    s["plan"] = "inactive"
+                    s["plan"]          = "inactive"
+                    s["is_subscribed"] = "false"
             _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, schools)
 
     return JSONResponse({"ok": True})
@@ -2234,18 +2441,21 @@ async def school_billing_checkout(request: Request, plan: str = Form(...)):
     if not price_id:
         return RedirectResponse("/school/billing?toast=Unknown+plan", status_code=303)
     stripe.api_key = STRIPE_SECRET_KEY
+    base = "https://music-school-app-hde7.onrender.com"
     try:
         session = stripe.checkout.Session.create(
             mode="subscription",
             line_items=[{"price": price_id, "quantity": 1}],
             customer_email=school["owner_email"],
             metadata={"school_id": school["school_id"], "plan": plan},
-            success_url=f"https://music-school-app-hde7.onrender.com/school/dashboard?toast=Subscription+active",
-            cancel_url=f"https://music-school-app-hde7.onrender.com/school/billing",
+            subscription_data={"trial_period_days": 30},
+            payment_method_collection="always",
+            success_url=f"{base}/school/subscribe?success={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{base}/school/subscribe?cancelled=1",
         )
         return RedirectResponse(session.url, status_code=303)
     except Exception as e:
-        return RedirectResponse(f"/school/billing?toast={str(e)[:80]}", status_code=303)
+        return RedirectResponse(f"/school/subscribe?cancelled=1&toast={str(e)[:80]}", status_code=303)
 
 
 # ── Policy signing ─────────────────────────────────────────────────────────────
@@ -2253,6 +2463,8 @@ async def school_billing_checkout(request: Request, plan: str = Form(...)):
 def school_policies_page(request: Request, toast: str = ""):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
     policies = [p for p in _read_csv(POLICIES_FILE, POLICIES_HEADERS)
                 if p["school_id"] == school["school_id"]]
     sigs     = _read_csv(SIGNATURES_FILE, SIGNATURES_HEADERS)
@@ -2295,6 +2507,8 @@ async def school_add_policy(request: Request,
                              title: str = Form(...), body: str = Form(...)):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
     _append_csv(POLICIES_FILE, POLICIES_HEADERS, {
         "id": secrets.token_hex(8), "school_id": school["school_id"],
         "title": title.strip(), "body": body.strip(),
@@ -2307,6 +2521,8 @@ async def school_add_policy(request: Request,
 def policy_signatures(request: Request, policy_id: str):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
     policy = next((p for p in _read_csv(POLICIES_FILE, POLICIES_HEADERS)
                    if p["id"] == policy_id and p["school_id"] == school["school_id"]), None)
     if not policy: return RedirectResponse("/school/policies", status_code=303)
@@ -2462,3 +2678,59 @@ async def mobile_school_billing_checkout(request: Request):
         return JSONResponse({"ok": True, "url": session.url})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+# ── Cron: daily backup + trial warnings ───────────────────────────────────────
+MS_BACKUP_DIR = "/data/auto_backups"
+MS_CRON_SECRET = os.environ.get("CRON_SECRET", "")
+
+@app.get("/api/cron/backup")
+def ms_cron_backup(request: Request):
+    if request.headers.get("X-Cron-Secret") != MS_CRON_SECRET or not MS_CRON_SECRET:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    os.makedirs(MS_BACKUP_DIR, exist_ok=True)
+    schools  = _read_csv(SCHOOLS_FILE,  SCHOOLS_HEADERS)
+    teachers = _read_csv(TEACHERS_FILE, TEACHERS_HEADERS)
+    students = _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
+    snapshot = {
+        "backup_date": datetime.now().isoformat(),
+        "schools":  schools,
+        "teachers": teachers,
+        "students": students,
+    }
+    fname = os.path.join(MS_BACKUP_DIR, f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+    with open(fname, "w") as f:
+        json.dump(snapshot, f)
+    all_backups = sorted([os.path.join(MS_BACKUP_DIR, x) for x in os.listdir(MS_BACKUP_DIR) if x.endswith(".json")])
+    for old in all_backups[:-30]:
+        os.remove(old)
+
+    # Trial expiry warnings — email at 5 days remaining
+    warned = 0
+    for s in schools:
+        if s.get("is_subscribed") == "true":
+            continue
+        trial_ends = s.get("trial_ends", "")
+        if not trial_ends:
+            continue
+        try:
+            days_left = (datetime.strptime(trial_ends, "%Y-%m-%d").date() - datetime.now().date()).days
+        except ValueError:
+            continue
+        if days_left == 5:
+            _send_email(
+                s["owner_email"],
+                "Your Music School App trial ends in 5 days",
+                (
+                    f"<p>Hi {s.get('owner_name','there')},</p>"
+                    f"<p>Your free trial of Music School App ends on <strong>{trial_ends}</strong>.</p>"
+                    f"<p>Subscribe to keep access to all your teachers, students, and data.</p>"
+                    f"<p><a href='https://music-school-app-hde7.onrender.com/school/subscribe' "
+                    f"style='display:inline-block;padding:12px 24px;background:#6366f1;color:#fff;"
+                    f"border-radius:8px;text-decoration:none;font-weight:700;'>Subscribe Now — $99/month</a></p>"
+                    f"<p style='color:#64748b;font-size:12px;'>Cancel anytime. Questions? Just reply to this email.</p>"
+                ),
+            )
+            warned += 1
+
+    return JSONResponse({"status": "ok", "file": fname, "kept": min(len(all_backups), 30), "trial_warnings_sent": warned})
