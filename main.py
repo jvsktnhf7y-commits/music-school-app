@@ -50,8 +50,10 @@ async def csrf_origin_middleware(request: Request, call_next):
             and not path.startswith("/api/") and path != "/waitlist"):
         origin = request.headers.get("origin") or request.headers.get("referer", "")
         if origin:
+            # "null" is sent by sandboxed iframes/data: URIs and produces an
+            # empty netloc — must fail closed (block), not silently pass.
             o_host = _urlparse(origin).netloc
-            if o_host and o_host != request.headers.get("host", ""):
+            if not o_host or o_host != request.headers.get("host", ""):
                 return Response("Cross-origin request blocked", status_code=403)
     return await call_next(request)
 
@@ -63,6 +65,17 @@ _login_attempts: dict = {}
 _MAX_ATTEMPTS = 5
 _LOCKOUT_SECS = 600
 
+def _client_ip(request: Request) -> str:
+    """Render terminates TLS at its edge proxy and sets X-Forwarded-For with
+    the real client IP; that header isn't attacker-settable since Render's
+    edge replaces any client-supplied value. request.client.host alone would
+    be Render's internal proxy IP for every request, collapsing all users
+    into one shared rate-limit bucket."""
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
 def _rl_blocked(ip: str) -> bool:
     e = _login_attempts.get(ip)
     return bool(e and e["locked_until"] > time.time())
@@ -70,7 +83,9 @@ def _rl_blocked(ip: str) -> bool:
 def _rl_fail(ip: str):
     now = time.time()
     e   = _login_attempts.get(ip, {"count": 0, "locked_until": 0})
-    if e["locked_until"] < now: e["count"] += 1
+    if e["locked_until"] and e["locked_until"] < now:
+        e = {"count": 0, "locked_until": 0}  # lockout window passed; start fresh
+    e["count"] += 1
     if e["count"] >= _MAX_ATTEMPTS: e["locked_until"] = now + _LOCKOUT_SECS
     _login_attempts[ip] = e
 
@@ -289,10 +304,19 @@ def _load_secret_key() -> str:
     if os.path.exists(SECRET_KEY_FILE):
         with open(SECRET_KEY_FILE) as f:
             return f.read().strip()
-    key = secrets.token_hex(32)
-    with open(SECRET_KEY_FILE, "w") as f:
-        f.write(key)
-    return key
+    # O_CREAT|O_EXCL makes file creation atomic: if two processes race here
+    # on first boot, only one wins the create and the loser reads back
+    # whatever the winner wrote, so both end up with the same key. Mode 0o600
+    # also keeps the file unreadable by anyone but the app's own user.
+    new_key = secrets.token_hex(32)
+    try:
+        fd = os.open(SECRET_KEY_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(new_key)
+        return new_key
+    except FileExistsError:
+        with open(SECRET_KEY_FILE) as f:
+            return f.read().strip()
 
 _token_signer = URLSafeTimedSerializer(_load_secret_key(), salt="ms-auth")
 
@@ -565,7 +589,7 @@ async def school_signup_post(
     email:       str = Form(...),
     password:    str = Form(...),
 ):
-    ip = request.client.host
+    ip = _client_ip(request)
     if _rl_blocked(ip):
         return RedirectResponse("/school/signup?error=Too+many+attempts.+Try+again+in+10+minutes.", status_code=303)
     _rl_fail(ip)  # count every signup attempt against the IP
@@ -609,7 +633,7 @@ def school_login_page(error: str = ""):
 
 @app.post("/school/login")
 async def school_login_post(request: Request, email: str = Form(...), password: str = Form(...)):
-    ip = request.client.host
+    ip = _client_ip(request)
     if _rl_blocked(ip):
         return RedirectResponse("/school/login?error=Too+many+attempts.+Try+again+in+10+minutes.", status_code=303)
     school = get_school_by_email(email.strip().lower())
@@ -1192,7 +1216,7 @@ def teacher_login_page(error: str = ""):
 
 @app.post("/teacher/login")
 async def teacher_login_post(request: Request, email: str = Form(...), password: str = Form(...)):
-    ip = request.client.host
+    ip = _client_ip(request)
     if _rl_blocked(ip):
         return RedirectResponse("/teacher/login?error=Too+many+attempts.+Try+again+in+10+minutes.", status_code=303)
     teacher = get_teacher_by_email(email.strip().lower())
@@ -1237,7 +1261,7 @@ def teacher_dashboard(request: Request):
 
     bal_rows = "".join(
         f'<div style="display:flex;align-items:center;justify-content:space-between;padding:9px 0;border-bottom:1px solid var(--border);">'
-        f'<span style="font-weight:600;">{"🟢" if float(s.get("prepaid",0))>0 else "🔴"} {s["name"]}</span>'
+        f'<span style="font-weight:600;">{"🟢" if float(s.get("prepaid",0))>0 else "🔴"} {_esc(s["name"])}</span>'
         f'<span style="color:{"var(--success)" if float(s.get("prepaid",0))>0 else "var(--danger)"};font-weight:700;">${float(s.get("prepaid",0)):.2f}</span>'
         f'</div>'
         for s in students
@@ -1245,7 +1269,7 @@ def teacher_dashboard(request: Request):
 
     content = f"""
 <h1>Dashboard</h1>
-<p style="color:var(--muted);margin-bottom:20px;">Welcome back, {teacher['name']}!</p>
+<p style="color:var(--muted);margin-bottom:20px;">Welcome back, {_esc(teacher['name'])}!</p>
 <div class="stats-row">
   <div class="stat-card"><div class="stat-icon" style="background:#ede9fe;">👥</div><div class="stat-val">{len(students)}</div><div class="stat-lbl">Students</div></div>
   <div class="stat-card"><div class="stat-icon" style="background:#d1fae5;">💰</div><div class="stat-val">${this_month:.2f}</div><div class="stat-lbl">This Month</div></div>
@@ -1364,7 +1388,7 @@ def teacher_student_detail(student_id: str, request: Request, toast: str = ""):
     notes_html = "".join(
         f'<div style="padding:12px 0;border-bottom:1px solid var(--border);">'
         f'<div style="font-size:11px;color:var(--muted);">{n.get("date","")}</div>'
-        f'<div style="font-size:13px;margin-top:4px;">{n.get("notes","")}</div>'
+        f'<div style="font-size:13px;margin-top:4px;">{_esc(n.get("notes",""))}</div>'
         + (f'<div style="font-size:12px;color:var(--success);margin-top:4px;"><strong>Assignment:</strong> {_esc(n["assignment"])}</div>' if n.get("assignment","").strip() else "")
         + '</div>'
         for n in notes[:5]
@@ -1874,7 +1898,7 @@ def parent_login_page(error: str = ""):
 @app.post("/parent/login")
 async def parent_login_post(request: Request,
     student_name: str = Form(...), parent_code: str = Form(...)):
-    ip = request.client.host
+    ip = _client_ip(request)
     if _rl_blocked(ip):
         return RedirectResponse("/parent/login?error=Too+many+attempts.+Try+again+in+10+minutes.", status_code=303)
     students = _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
@@ -1916,7 +1940,7 @@ def parent_dashboard(request: Request):
         latest_html = (
             f'<div class="card" style="border-color:#a5b4fc;">'
             f'<h3>📌 Latest Note — {latest.get("date","")}</h3>'
-            f'<p style="font-size:13px;margin:8px 0;">{latest.get("notes","")}</p>'
+            f'<p style="font-size:13px;margin:8px 0;">{_esc(latest.get("notes",""))}</p>'
             + (f'<div style="background:#f0fdf4;border-left:3px solid #10b981;padding:8px 12px;border-radius:0 6px 6px 0;font-size:13px;"><strong>Assignment:</strong> {_esc(latest["assignment"])}</div>' if latest.get("assignment","").strip() else "")
             + "</div>"
         )
@@ -1927,7 +1951,7 @@ def parent_dashboard(request: Request):
     bal_color = "var(--success)" if prepaid > 0 else "var(--danger)"
 
     content = f"""
-<h1>Welcome, {student['name']}! 👋</h1>
+<h1>Welcome, {_esc(student['name'])}! 👋</h1>
 <p style="color:var(--muted);margin-bottom:20px;">Your student portal</p>
 <div class="stats-row">
   <div class="stat-card"><div class="stat-icon" style="background:#d1fae5;">💰</div>
@@ -2032,7 +2056,7 @@ def _send_push(token: str, title: str, body: str, data: dict = None):
 # ── School Admin mobile auth ───────────────────────────────────────────────────
 @app.post("/api/mobile/school/login")
 async def mobile_school_login(request: Request):
-    ip = request.client.host
+    ip = _client_ip(request)
     if _rl_blocked(ip):
         return JSONResponse({"ok": False, "error": "Too many attempts"}, status_code=429)
     data   = await request.json()
@@ -2111,7 +2135,7 @@ def mobile_school_analytics(request: Request):
 # ── Teacher mobile auth ────────────────────────────────────────────────────────
 @app.post("/api/mobile/teacher/login")
 async def mobile_teacher_login(request: Request):
-    ip = request.client.host
+    ip = _client_ip(request)
     if _rl_blocked(ip):
         return JSONResponse({"ok": False, "error": "Too many attempts"}, status_code=429)
     data    = await request.json()
@@ -2307,7 +2331,7 @@ async def mobile_teacher_register_push(request: Request):
 # ── Parent mobile auth ─────────────────────────────────────────────────────────
 @app.post("/api/mobile/parent/login")
 async def mobile_parent_login(request: Request):
-    ip = request.client.host
+    ip = _client_ip(request)
     if _rl_blocked(ip):
         return JSONResponse({"ok": False, "error": "Too many attempts"}, status_code=429)
     data   = await request.json()
@@ -2719,7 +2743,7 @@ def policy_sign_page(request: Request, policy_id: str, code: str = ""):
     <form method="post" action="/sign/{policy_id}">
       <div class="form-group">
         <label>Your Student Access Code</label>
-        <input type="text" name="code" value="{code}" placeholder="Enter your access code" required>
+        <input type="text" name="code" value="{_esc(code)}" placeholder="Enter your access code" required>
       </div>
       <button class="btn" type="submit">✍️ I agree &amp; sign</button>
     </form>
@@ -2782,7 +2806,7 @@ def mobile_parent_policies(request: Request):
 # ── Mobile: school billing ─────────────────────────────────────────────────────
 @app.post("/api/mobile/school/billing/checkout")
 async def mobile_school_billing_checkout(request: Request):
-    school = _require_school(request)
+    school = _school_auth(request)  # mobile sends a Bearer token, not the school_id cookie
     if not school: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
     if not STRIPE_SECRET_KEY:
         return JSONResponse({"ok": False, "error": "Stripe not configured"}, status_code=503)
@@ -2816,25 +2840,35 @@ R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 R2_BUCKET            = os.environ.get("R2_BUCKET", "")
 R2_PREFIX            = "music-school-app"
 
+_r2_client_cache = None
+
 def _r2_client():
-    """Returns a boto3 S3-compatible client for Cloudflare R2, or None if unconfigured."""
+    """Returns a cached boto3 S3-compatible client for Cloudflare R2, or None
+    if unconfigured. Cached at module scope so we don't pay TLS/session setup
+    on every call — this is hit on every backup and every admin list/download."""
+    global _r2_client_cache
     if not (R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET):
         return None
-    import boto3
-    from botocore.config import Config as _BotoConfig
-    return boto3.client(
-        "s3",
-        endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
-        aws_access_key_id=R2_ACCESS_KEY_ID,
-        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-        config=_BotoConfig(signature_version="s3v4"),
-        region_name="auto",
-    )
+    if _r2_client_cache is None:
+        import boto3
+        from botocore.config import Config as _BotoConfig
+        _r2_client_cache = boto3.client(
+            "s3",
+            endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+            aws_access_key_id=R2_ACCESS_KEY_ID,
+            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+            config=_BotoConfig(signature_version="s3v4"),
+            region_name="auto",
+        )
+    return _r2_client_cache
+
+_BACKUP_EXCLUDE_FILES = {"secret_key"}  # session-signing secret: never leaves the server
 
 def _build_full_backup_zip() -> bytes:
-    """Zips every file under /data (all CSVs, JSON stores, secret key) except
-    the local auto_backups directory itself, so a restore recreates the full
-    working state, not just a curated subset."""
+    """Zips every file under /data (all CSVs, JSON stores) except the local
+    auto_backups directory and the session-signing secret, so a restore
+    recreates the full working state without leaking the token-signing key
+    to anyone with backup-download access."""
     import zipfile
     from io import BytesIO
     buf = BytesIO()
@@ -2842,6 +2876,8 @@ def _build_full_backup_zip() -> bytes:
         for root, dirs, files in os.walk("/data"):
             dirs[:] = [d for d in dirs if d != "auto_backups"]
             for fn in files:
+                if fn in _BACKUP_EXCLUDE_FILES:
+                    continue
                 full = os.path.join(root, fn)
                 arc  = os.path.relpath(full, "/data")
                 zf.write(full, arcname=arc)
@@ -2923,12 +2959,20 @@ def ms_cron_backup(request: Request):
     })
 
 
+def _require_platform_admin(request: Request) -> bool:
+    """The backup zip spans every tenant school's data (and, until the fix
+    above, the signing secret too) — this must NEVER be gated by tenant auth
+    like _require_school, since any paying customer could pass that check
+    and download every other customer's data. Reuses the same X-Cron-Secret
+    already used to authenticate the backup cron itself."""
+    return bool(MS_CRON_SECRET) and request.headers.get("X-Cron-Secret") == MS_CRON_SECRET
+
 @app.get("/api/admin/backups")
 def ms_list_offsite_backups(request: Request):
-    """List backups stored in R2, newest first. Gated by school-admin auth."""
-    school = _require_school(request)
-    if not school:
-        return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    """List backups stored in R2, newest first. Platform-admin only —
+    call with an X-Cron-Secret header, not a school session."""
+    if not _require_platform_admin(request):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     client = _r2_client()
     if not client:
         return JSONResponse({"ok": False, "error": "R2 not configured"}, status_code=503)
@@ -2949,10 +2993,10 @@ def ms_list_offsite_backups(request: Request):
 @app.get("/api/admin/backups/download")
 def ms_download_offsite_backup(request: Request, key: str = Query(...)):
     """Download a specific R2 backup zip for manual restore or integrity
-    verification. Restore is deliberately not automated over HTTP."""
-    school = _require_school(request)
-    if not school:
-        return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    verification. Platform-admin only — see _require_platform_admin above.
+    Restore is deliberately not automated over HTTP."""
+    if not _require_platform_admin(request):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     if not key.startswith(f"{R2_PREFIX}/"):
         return JSONResponse({"ok": False, "error": "invalid key"}, status_code=400)
     client = _r2_client()
