@@ -2806,30 +2806,84 @@ async def mobile_school_billing_checkout(request: Request):
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
-# ── Cron: daily backup + trial warnings ───────────────────────────────────────
-MS_BACKUP_DIR = "/data/auto_backups"
+# ── Off-site backup (Cloudflare R2 — S3-compatible, free egress) ─────────────
+MS_BACKUP_DIR  = "/data/auto_backups"
 MS_CRON_SECRET = os.environ.get("CRON_SECRET", "")
+
+R2_ACCOUNT_ID        = os.environ.get("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY_ID     = os.environ.get("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET            = os.environ.get("R2_BUCKET", "")
+R2_PREFIX            = "music-school-app"
+
+def _r2_client():
+    """Returns a boto3 S3-compatible client for Cloudflare R2, or None if unconfigured."""
+    if not (R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET):
+        return None
+    import boto3
+    from botocore.config import Config as _BotoConfig
+    return boto3.client(
+        "s3",
+        endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        config=_BotoConfig(signature_version="s3v4"),
+        region_name="auto",
+    )
+
+def _build_full_backup_zip() -> bytes:
+    """Zips every file under /data (all CSVs, JSON stores, secret key) except
+    the local auto_backups directory itself, so a restore recreates the full
+    working state, not just a curated subset."""
+    import zipfile
+    from io import BytesIO
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, files in os.walk("/data"):
+            dirs[:] = [d for d in dirs if d != "auto_backups"]
+            for fn in files:
+                full = os.path.join(root, fn)
+                arc  = os.path.relpath(full, "/data")
+                zf.write(full, arcname=arc)
+    buf.seek(0)
+    return buf.getvalue()
+
 
 @app.get("/api/cron/backup")
 def ms_cron_backup(request: Request):
+    """Daily backup: zips all of /data and uploads it to Cloudflare R2 (the
+    system of record for disaster recovery). Keeps a 7-day local copy as a
+    fast fallback. Configure remote retention with an R2 bucket lifecycle
+    rule rather than app-side deletion."""
     if request.headers.get("X-Cron-Secret") != MS_CRON_SECRET or not MS_CRON_SECRET:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    zip_bytes = _build_full_backup_zip()
+    ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     os.makedirs(MS_BACKUP_DIR, exist_ok=True)
-    schools  = _read_csv(SCHOOLS_FILE,  SCHOOLS_HEADERS)
-    teachers = _read_csv(TEACHERS_FILE, TEACHERS_HEADERS)
-    students = _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
-    snapshot = {
-        "backup_date": datetime.now().isoformat(),
-        "schools":  schools,
-        "teachers": teachers,
-        "students": students,
-    }
-    fname = os.path.join(MS_BACKUP_DIR, f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
-    with open(fname, "w") as f:
-        json.dump(snapshot, f)
-    all_backups = sorted([os.path.join(MS_BACKUP_DIR, x) for x in os.listdir(MS_BACKUP_DIR) if x.endswith(".json")])
-    for old in all_backups[:-30]:
+    local_path = os.path.join(MS_BACKUP_DIR, f"backup_{ts}.zip")
+    with open(local_path, "wb") as f:
+        f.write(zip_bytes)
+    local_backups = sorted(
+        os.path.join(MS_BACKUP_DIR, x) for x in os.listdir(MS_BACKUP_DIR) if x.endswith(".zip")
+    )
+    for old in local_backups[:-7]:
         os.remove(old)
+
+    offsite_uploaded = False
+    offsite_error     = None
+    client = _r2_client()
+    if client:
+        try:
+            client.put_object(Bucket=R2_BUCKET, Key=f"{R2_PREFIX}/backup_{ts}.zip", Body=zip_bytes)
+            offsite_uploaded = True
+        except Exception as exc:
+            offsite_error = str(exc)[:300]
+    else:
+        offsite_error = "R2 not configured"
+
+    schools = _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
 
     # Trial expiry warnings — email at 5 days remaining
     warned = 0
@@ -2859,4 +2913,51 @@ def ms_cron_backup(request: Request):
             )
             warned += 1
 
-    return JSONResponse({"status": "ok", "file": fname, "kept": min(len(all_backups), 30), "trial_warnings_sent": warned})
+    return JSONResponse({
+        "status": "ok",
+        "offsite_uploaded": offsite_uploaded,
+        "offsite_error": offsite_error,
+        "local_file": local_path,
+        "local_kept": len(local_backups[-7:]),
+        "trial_warnings_sent": warned,
+    })
+
+
+@app.get("/api/admin/backups")
+def ms_list_offsite_backups(request: Request):
+    """List backups stored in R2, newest first. Gated by school-admin auth."""
+    school = _require_school(request)
+    if not school:
+        return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    client = _r2_client()
+    if not client:
+        return JSONResponse({"ok": False, "error": "R2 not configured"}, status_code=503)
+    try:
+        resp = client.list_objects_v2(Bucket=R2_BUCKET, Prefix=f"{R2_PREFIX}/")
+        items = sorted(resp.get("Contents", []), key=lambda o: o["LastModified"], reverse=True)
+        return JSONResponse({"ok": True, "backups": [
+            {"key": o["Key"], "size": o["Size"], "last_modified": o["LastModified"].isoformat()}
+            for o in items
+        ]})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)[:300]}, status_code=500)
+
+
+@app.get("/api/admin/backups/download")
+def ms_download_offsite_backup(request: Request, key: str = Query(...)):
+    """Download a specific R2 backup zip for manual restore or integrity
+    verification. Restore is deliberately not automated over HTTP."""
+    school = _require_school(request)
+    if not school:
+        return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    if not key.startswith(f"{R2_PREFIX}/"):
+        return JSONResponse({"ok": False, "error": "invalid key"}, status_code=400)
+    client = _r2_client()
+    if not client:
+        return JSONResponse({"ok": False, "error": "R2 not configured"}, status_code=503)
+    try:
+        obj = client.get_object(Bucket=R2_BUCKET, Key=key)
+        return Response(content=obj["Body"].read(), media_type="application/zip",
+                        headers={"Content-Disposition": f'attachment; filename="{os.path.basename(key)}"'})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)[:300]}, status_code=500)
