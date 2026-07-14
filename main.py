@@ -2933,8 +2933,11 @@ def ms_list_offsite_backups(request: Request):
     if not client:
         return JSONResponse({"ok": False, "error": "R2 not configured"}, status_code=503)
     try:
-        resp = client.list_objects_v2(Bucket=R2_BUCKET, Prefix=f"{R2_PREFIX}/")
-        items = sorted(resp.get("Contents", []), key=lambda o: o["LastModified"], reverse=True)
+        paginator = client.get_paginator("list_objects_v2")
+        items = []
+        for page in paginator.paginate(Bucket=R2_BUCKET, Prefix=f"{R2_PREFIX}/"):
+            items.extend(page.get("Contents", []))
+        items.sort(key=lambda o: o["LastModified"], reverse=True)
         return JSONResponse({"ok": True, "backups": [
             {"key": o["Key"], "size": o["Size"], "last_modified": o["LastModified"].isoformat()}
             for o in items
