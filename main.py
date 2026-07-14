@@ -601,7 +601,9 @@ def privacy_page():
 <ul>
   <li><strong>Stripe</strong> — payment processing</li>
   <li><strong>SendGrid</strong> — transactional email delivery</li>
+  <li><strong>Expo</strong> — push notification delivery. If push notifications are enabled, the device push token and the notification content (which may include a student's first name, e.g. "New note for [name]") are sent to Expo's push service to be delivered to the device.</li>
   <li><strong>Cloudflare R2</strong> — encrypted off-site backup storage</li>
+  <li><strong>Google Fonts</strong> — our pages load a web font from Google's servers, which receives the viewer's IP address as part of that request</li>
   <li><strong>Render</strong> — application hosting</li>
 </ul>
 
