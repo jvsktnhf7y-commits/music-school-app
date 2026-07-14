@@ -566,10 +566,9 @@ def _legal_page(title: str, body_html: str) -> str:
 def privacy_page():
     body = """
 <h1>Privacy Policy</h1>
-<div class="updated">Last updated: [DATE — fill in before launch]</div>
-<div class="notice">⚠️ Placeholder: replace [Your Business Name], [contact email], and [DATE] below before this page goes live, and have a lawyer review this before relying on it for compliance.</div>
+<div class="updated">Last updated: July 14, 2026</div>
 
-<p>This Privacy Policy explains how [Your Business Name] ("we", "us") collects, uses, and protects information through Music School App (the "Service"), a tool for music schools to manage teachers, students, lessons, attendance, and payments.</p>
+<p>This Privacy Policy explains how Robert Ollech ("we", "us") collects, uses, and protects information through Music School App (the "Service"), a tool for music schools to manage teachers, students, lessons, attendance, and payments.</p>
 
 <h2>Who uses this Service</h2>
 <p>Music School App is used by a school administrator to manage their school. The school admin invites teachers, who each manage their own roster of students. Parents may be given a separate login (an access code) by their child's teacher to view lesson notes, attendance, and make payments, and to review and sign school policies.</p>
@@ -585,7 +584,7 @@ def privacy_page():
 
 <h2>Children's data and COPPA</h2>
 <p>Most students managed through this Service are children under 13. We do not knowingly collect information directly from children through this Service — all student information is entered by the school or teacher as part of managing music lessons, not through any interaction by the child with the Service itself. The school is responsible for its own relationship with students and parents, and for any consent required under applicable law (including COPPA) for the information it chooses to enter about a student.</p>
-<p>Parents may contact their child's school at any time to review, correct, or request deletion of their child's information. If you are a parent with a privacy concern we can help with directly, contact us at [contact email].</p>
+<p>Parents may contact their child's school at any time to review, correct, or request deletion of their child's information. If you are a parent with a privacy concern we can help with directly, contact us at robertcollech@gmail.com.</p>
 
 <h2>How we use information</h2>
 <ul>
@@ -608,7 +607,7 @@ def privacy_page():
 </ul>
 
 <h2>Data retention and deletion</h2>
-<p>We retain school, teacher, and student data for as long as the school's account is active. A school admin can remove teachers, and teachers can remove students, at any time. To request deletion of a school's account or data, email [contact email]; we will process deletion requests within a reasonable time, subject to what we need to retain for legal, tax, or dispute-resolution purposes.</p>
+<p>We retain school, teacher, and student data for as long as the school's account is active. A school admin can remove teachers, and teachers can remove students, at any time. To request deletion of a school's account or data, email robertcollech@gmail.com; we will process deletion requests within a reasonable time, subject to what we need to retain for legal, tax, or dispute-resolution purposes.</p>
 
 <h2>Security</h2>
 <p>Passwords are hashed with bcrypt. Sessions use signed, time-limited tokens. Data is encrypted in transit (HTTPS). Backups are stored off-site and access-restricted. No system is perfectly secure, and we cannot guarantee absolute security.</p>
@@ -620,7 +619,7 @@ def privacy_page():
 <p>We may update this policy from time to time. Material changes will be reflected by updating the "Last updated" date above.</p>
 
 <h2>Contact</h2>
-<p>Questions about this policy: [contact email]</p>
+<p>Questions about this policy: robertcollech@gmail.com</p>
 """
     return HTMLResponse(_legal_page("Privacy Policy", body))
 
@@ -629,10 +628,9 @@ def privacy_page():
 def terms_page():
     body = """
 <h1>Terms of Service</h1>
-<div class="updated">Last updated: [DATE — fill in before launch]</div>
-<div class="notice">⚠️ Placeholder: replace [Your Business Name], [contact email], [governing state/country], and [DATE] before this page goes live, and have a lawyer review this before relying on it.</div>
+<div class="updated">Last updated: July 14, 2026</div>
 
-<p>These Terms of Service ("Terms") govern your use of Music School App (the "Service"), operated by [Your Business Name] ("we", "us"). By creating a school account, you agree to these Terms on behalf of your school.</p>
+<p>These Terms of Service ("Terms") govern your use of Music School App (the "Service"), operated by Robert Ollech ("we", "us"). By creating a school account, you agree to these Terms on behalf of your school.</p>
 
 <h2>The Service</h2>
 <p>Music School App is a subscription tool for music schools to manage teachers, students, scheduling, attendance, lesson notes, and payments. You are responsible for the accuracy of the information entered by your school and its teachers, and for your own compliance with any laws that apply to your school, including obligations to your students and their parents.</p>
@@ -668,13 +666,13 @@ def terms_page():
 <p>We may suspend or terminate accounts that violate these Terms or that we reasonably believe pose a risk to the Service or other users.</p>
 
 <h2>Governing law</h2>
-<p>These Terms are governed by the laws of [governing state/country], without regard to conflict-of-law principles.</p>
+<p>These Terms are governed by the laws of the State of California, United States, without regard to conflict-of-law principles.</p>
 
 <h2>Changes to these Terms</h2>
 <p>We may update these Terms from time to time. Continued use of the Service after a change constitutes acceptance of the updated Terms.</p>
 
 <h2>Contact</h2>
-<p>Questions about these Terms: [contact email]</p>
+<p>Questions about these Terms: robertcollech@gmail.com</p>
 """
     return HTMLResponse(_legal_page("Terms of Service", body))
 
