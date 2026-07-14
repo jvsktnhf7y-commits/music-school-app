@@ -57,6 +57,46 @@ async def csrf_origin_middleware(request: Request, call_next):
                 return Response("Cross-origin request blocked", status_code=403)
     return await call_next(request)
 
+
+_MOBILE_SUB_GATE_EXEMPT = {
+    "/api/mobile/school/login", "/api/mobile/teacher/login",
+    "/api/mobile/school/billing/checkout", "/api/mobile/school/billing/portal",
+    "/api/mobile/school/subscription-status", "/api/mobile/teacher/subscription-status",
+}
+
+@app.middleware("http")
+async def mobile_subscription_gate(request: Request, call_next):
+    """Mobile school/teacher API calls are gated by the school's subscription.
+    Web routes redirect to /school/subscribe via _school_access_response, but
+    mobile has no equivalent per-route check — without this, a school whose
+    trial expired or subscription lapsed could keep using the mobile app
+    indefinitely. Login and billing endpoints stay exempt (a school must be
+    able to check status and subscribe even while unsubscribed)."""
+    path = request.url.path
+    if (path in _MOBILE_SUB_GATE_EXEMPT
+            or not (path.startswith("/api/mobile/school/") or path.startswith("/api/mobile/teacher/"))):
+        return await call_next(request)
+
+    school = None
+    if path.startswith("/api/mobile/school/"):
+        payload = _bearer_payload(request, "school")
+        if payload:
+            school = get_school(payload["s"])
+    else:
+        payload = _bearer_payload(request, "teacher")
+        if payload:
+            teacher = get_teacher(payload["s"])
+            if teacher:
+                school = get_school(teacher.get("school_id", ""))
+
+    if school:
+        has_access, _ = school_has_access(school)
+        if not has_access:
+            return JSONResponse({"ok": False, "error": "subscription_required"}, status_code=402)
+
+    return await call_next(request)  # no valid token found: let the route's own auth 401 it
+
+
 os.makedirs("static", exist_ok=True)
 os.makedirs("/data", exist_ok=True)
 
@@ -2248,6 +2288,19 @@ def _school_auth(request: Request) -> dict | None:
     payload = _bearer_payload(request, "school")
     return get_school(payload["s"]) if payload else None
 
+@app.get("/api/mobile/school/subscription-status")
+def mobile_school_subscription_status(request: Request):
+    school = _school_auth(request)
+    if not school: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    has_access, reason = school_has_access(school)
+    return JSONResponse({
+        "ok": True,
+        "active": has_access,
+        "reason": reason,  # 'subscribed' | 'trial' | 'expired'
+        "trial_days_remaining": school_trial_days(school),
+    })
+
+
 @app.get("/api/mobile/school/dashboard")
 def mobile_school_dashboard(request: Request):
     school = _school_auth(request)
@@ -2326,6 +2379,22 @@ async def mobile_teacher_login(request: Request):
 def _teacher_auth(request: Request) -> dict | None:
     payload = _bearer_payload(request, "teacher")
     return get_teacher(payload["s"]) if payload else None
+
+@app.get("/api/mobile/teacher/subscription-status")
+def mobile_teacher_subscription_status(request: Request):
+    teacher = _teacher_auth(request)
+    if not teacher: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    school = get_school(teacher.get("school_id", ""))
+    if not school:
+        return JSONResponse({"ok": True, "active": False, "reason": "expired", "trial_days_remaining": 0})
+    has_access, reason = school_has_access(school)
+    return JSONResponse({
+        "ok": True,
+        "active": has_access,
+        "reason": reason,
+        "trial_days_remaining": school_trial_days(school),
+    })
+
 
 @app.get("/api/mobile/teacher/dashboard")
 def mobile_teacher_dashboard(request: Request):
