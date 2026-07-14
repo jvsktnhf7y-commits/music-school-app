@@ -66,14 +66,17 @@ _MAX_ATTEMPTS = 5
 _LOCKOUT_SECS = 600
 
 def _client_ip(request: Request) -> str:
-    """Render terminates TLS at its edge proxy and sets X-Forwarded-For with
-    the real client IP; that header isn't attacker-settable since Render's
-    edge replaces any client-supplied value. request.client.host alone would
-    be Render's internal proxy IP for every request, collapsing all users
-    into one shared rate-limit bucket."""
+    """request.client.host alone is Render's internal proxy IP for every
+    request, collapsing all users into one shared rate-limit bucket. Read
+    the LAST entry in X-Forwarded-For, not the first: that header is an
+    append-only chain, and the first entry can be attacker-supplied if a
+    proxy appends rather than replaces. The last entry is whatever Render's
+    own edge (the only hop in front of a standard Render web service)
+    appended, which is safe regardless of whether Render appends or
+    replaces the incoming header."""
     fwd = request.headers.get("x-forwarded-for", "")
     if fwd:
-        return fwd.split(",")[0].strip()
+        return fwd.split(",")[-1].strip()
     return request.client.host if request.client else "unknown"
 
 def _rl_blocked(ip: str) -> bool:
