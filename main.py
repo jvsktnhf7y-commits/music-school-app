@@ -2601,7 +2601,7 @@ async def school_billing_checkout(request: Request, plan: str = Form(...)):
             line_items=[{"price": price_id, "quantity": 1}],
             customer_email=school["owner_email"],
             metadata={"school_id": school["school_id"], "plan": plan},
-            subscription_data={"trial_period_days": 30},
+            subscription_data={"trial_period_days": 30, "metadata": {"school_id": school["school_id"]}},
             payment_method_collection="always",
             success_url=f"{base}/school/subscribe?success={{CHECKOUT_SESSION_ID}}",
             cancel_url=f"{base}/school/subscribe?cancelled=1",
@@ -2825,8 +2825,10 @@ async def mobile_school_billing_checkout(request: Request):
             line_items=[{"price": price_id, "quantity": 1}],
             customer_email=school["owner_email"],
             metadata={"school_id": school["school_id"], "plan": plan},
-            success_url=f"https://music-school-app-hde7.onrender.com/school/dashboard?toast=Subscription+active",
-            cancel_url=f"https://music-school-app-hde7.onrender.com/school/billing",
+            subscription_data={"trial_period_days": 30, "metadata": {"school_id": school["school_id"]}},
+            payment_method_collection="always",
+            success_url=f"https://music-school-app-hde7.onrender.com/school/subscribe?success={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"https://music-school-app-hde7.onrender.com/school/subscribe?cancelled=1",
         )
         return JSONResponse({"ok": True, "url": session.url})
     except Exception as e:
