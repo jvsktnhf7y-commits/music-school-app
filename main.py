@@ -38,6 +38,23 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
+from urllib.parse import urlparse as _urlparse
+
+@app.middleware("http")
+async def csrf_origin_middleware(request: Request, call_next):
+    """Verify Origin/Referer host on state-changing browser requests.
+    Exempt: /api/* (bearer-auth mobile, webhooks, cron — CSRF-immune) and
+    /waitlist (the landing page posts to it cross-origin by design)."""
+    path = request.url.path
+    if (request.method in ("POST", "PUT", "PATCH", "DELETE")
+            and not path.startswith("/api/") and path != "/waitlist"):
+        origin = request.headers.get("origin") or request.headers.get("referer", "")
+        if origin:
+            o_host = _urlparse(origin).netloc
+            if o_host and o_host != request.headers.get("host", ""):
+                return Response("Cross-origin request blocked", status_code=403)
+    return await call_next(request)
+
 os.makedirs("static", exist_ok=True)
 os.makedirs("/data", exist_ok=True)
 
@@ -199,6 +216,27 @@ def _hash(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()
 
 
+# ── Password hashing (bcrypt, with legacy sha256 fallback) ────────────────────
+import bcrypt as _bcrypt
+from html import escape as _esc
+
+def _hash_password(password: str) -> str:
+    return _bcrypt.hashpw(password.encode(), _bcrypt.gensalt()).decode()
+
+def _check_password(password: str, stored: str) -> bool:
+    if not stored:
+        return False
+    if stored.startswith("$2"):
+        try:
+            return _bcrypt.checkpw(password.encode(), stored.encode())
+        except ValueError:
+            return False
+    return _hash(password) == stored  # legacy sha256
+
+def _needs_rehash(stored: str) -> bool:
+    return bool(stored) and not stored.startswith("$2")
+
+
 # ── School helpers ─────────────────────────────────────────────────────────────
 def get_school(school_id: str) -> dict | None:
     return next((s for s in _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
@@ -311,6 +349,13 @@ def get_teacher(teacher_id: str) -> dict | None:
 def get_teacher_by_email(email: str) -> dict | None:
     return next((t for t in _read_csv(TEACHERS_FILE, TEACHERS_HEADERS)
                  if t["email"] == email and t.get("active", "true") == "true"), None)
+
+def _update_teacher(teacher_id: str, **kwargs):
+    rows = _read_csv(TEACHERS_FILE, TEACHERS_HEADERS)
+    for r in rows:
+        if r["teacher_id"] == teacher_id:
+            r.update(kwargs)
+    _write_csv(TEACHERS_FILE, TEACHERS_HEADERS, rows)
 
 
 # ── Student helpers ────────────────────────────────────────────────────────────
@@ -428,7 +473,7 @@ def parent_page(title, content, active):
 # ── Login pages ────────────────────────────────────────────────────────────────
 def _login_html(title: str, action: str, fields: str, error: str = "",
                 signup_link: str = "", extra: str = "") -> str:
-    err = f'<div class="alert alert-danger">{error}</div>' if error else ""
+    err = f'<div class="alert alert-danger">{_esc(error)}</div>' if error else ""
     sig = f'<p style="text-align:center;margin-top:14px;font-size:13px;">{signup_link}</p>' if signup_link else ""
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -468,7 +513,7 @@ def root():
 # ═══════════════════════════════════════════════════════════════════════════════
 @app.get("/school/signup", response_class=HTMLResponse)
 def school_signup_page(error: str = ""):
-    err = f'<div class="alert alert-danger">{error}</div>' if error else ""
+    err = f'<div class="alert alert-danger">{_esc(error)}</div>' if error else ""
     return HTMLResponse(f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -514,22 +559,28 @@ def school_signup_page(error: str = ""):
 
 @app.post("/school/signup")
 async def school_signup_post(
+    request:     Request,
     school_name: str = Form(...),
     owner_name:  str = Form(...),
     email:       str = Form(...),
     password:    str = Form(...),
 ):
+    ip = request.client.host
+    if _rl_blocked(ip):
+        return RedirectResponse("/school/signup?error=Too+many+attempts.+Try+again+in+10+minutes.", status_code=303)
+    _rl_fail(ip)  # count every signup attempt against the IP
     email = email.strip().lower()
     if get_school_by_email(email):
         return RedirectResponse(f"/school/signup?error=Email+already+registered", status_code=303)
     school_id  = secrets.token_hex(8)
     trial_ends = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+    pw_hash    = _hash_password(password)
     _append_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, {
         "school_id":     school_id,
         "name":          school_name.strip(),
         "owner_email":   email,
         "owner_name":    owner_name.strip(),
-        "password_hash": _hash(password),
+        "password_hash": pw_hash,
         "plan":          "trial",
         "created_at":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "active":        "true",
@@ -537,7 +588,7 @@ async def school_signup_post(
         "is_subscribed": "false",
     })
     resp = RedirectResponse("/school/subscribe", status_code=303)
-    resp.set_cookie("school_id", issue_token("school", school_id, _hash(password)),
+    resp.set_cookie("school_id", issue_token("school", school_id, pw_hash),
                     httponly=True, secure=True, samesite="lax", max_age=TOKEN_MAX_AGE_WEB)
     return resp
 
@@ -562,10 +613,14 @@ async def school_login_post(request: Request, email: str = Form(...), password: 
     if _rl_blocked(ip):
         return RedirectResponse("/school/login?error=Too+many+attempts.+Try+again+in+10+minutes.", status_code=303)
     school = get_school_by_email(email.strip().lower())
-    if school and school["password_hash"] == _hash(password):
+    if school and _check_password(password, school["password_hash"]):
         _rl_clear(ip)
+        stored = school["password_hash"]
+        if _needs_rehash(stored):
+            stored = _hash_password(password)
+            _update_school(school["school_id"], password_hash=stored)
         resp = RedirectResponse("/school/dashboard", status_code=303)
-        resp.set_cookie("school_id", issue_token("school", school["school_id"], school["password_hash"]),
+        resp.set_cookie("school_id", issue_token("school", school["school_id"], stored),
                         httponly=True, secure=True, samesite="lax", max_age=TOKEN_MAX_AGE_WEB)
         return resp
     _rl_fail(ip)
@@ -792,7 +847,7 @@ def school_invite_page(request: Request, error: str = ""):
     if not school: return RedirectResponse("/school/login", status_code=303)
     gate = _school_access_response(school)
     if gate: return gate
-    err = f'<div class="alert alert-danger">{error}</div>' if error else ""
+    err = f'<div class="alert alert-danger">{_esc(error)}</div>' if error else ""
     content = f"""
 <div style="max-width:480px;">
   <h1 style="margin-bottom:20px;">Invite a Teacher</h1>
@@ -831,7 +886,7 @@ async def school_invite_post(request: Request,
         "school_id":     school["school_id"],
         "name":          name.strip(),
         "email":         email,
-        "password_hash": _hash(password),
+        "password_hash": _hash_password(password),
         "created_at":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "active":        "true",
     })
@@ -1034,7 +1089,7 @@ def school_settings(request: Request, toast: str = ""):
     if not school: return RedirectResponse("/school/login", status_code=303)
     gate = _school_access_response(school)
     if gate: return gate
-    t = f'<div class="alert alert-success">{toast}</div>' if toast else ""
+    t = f'<div class="alert alert-success">{_esc(toast)}</div>' if toast else ""
     has_access, reason = school_has_access(school)
     days_left = school_trial_days(school)
     if reason == "subscribed":
@@ -1108,16 +1163,13 @@ async def school_password_post(request: Request,
     if not school: return RedirectResponse("/school/login", status_code=303)
     gate = _school_access_response(school)
     if gate: return gate
-    if school["password_hash"] != _hash(current_password):
+    if not _check_password(current_password, school["password_hash"]):
         return RedirectResponse("/school/settings?toast=Incorrect+current+password", status_code=303)
-    rows = _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
-    for r in rows:
-        if r["school_id"] == school["school_id"]:
-            r["password_hash"] = _hash(new_password)
-    _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, rows)
+    new_hash = _hash_password(new_password)
+    _update_school(school["school_id"], password_hash=new_hash)
     # Password change invalidates all outstanding tokens; reissue this session's
     resp = RedirectResponse("/school/settings?toast=Password+updated", status_code=303)
-    resp.set_cookie("school_id", issue_token("school", school["school_id"], _hash(new_password)),
+    resp.set_cookie("school_id", issue_token("school", school["school_id"], new_hash),
                     httponly=True, secure=True, samesite="lax", max_age=TOKEN_MAX_AGE_WEB)
     return resp
 
@@ -1144,10 +1196,14 @@ async def teacher_login_post(request: Request, email: str = Form(...), password:
     if _rl_blocked(ip):
         return RedirectResponse("/teacher/login?error=Too+many+attempts.+Try+again+in+10+minutes.", status_code=303)
     teacher = get_teacher_by_email(email.strip().lower())
-    if teacher and teacher["password_hash"] == _hash(password) and teacher.get("active","true") == "true":
+    if teacher and teacher.get("active","true") == "true" and _check_password(password, teacher["password_hash"]):
         _rl_clear(ip)
+        stored = teacher["password_hash"]
+        if _needs_rehash(stored):
+            stored = _hash_password(password)
+            _update_teacher(teacher["teacher_id"], password_hash=stored)
         resp = RedirectResponse("/teacher/dashboard", status_code=303)
-        resp.set_cookie("teacher_id", issue_token("teacher", teacher["teacher_id"], teacher["password_hash"]),
+        resp.set_cookie("teacher_id", issue_token("teacher", teacher["teacher_id"], stored),
                         httponly=True, secure=True, samesite="lax", max_age=TOKEN_MAX_AGE_WEB)
         return resp
     _rl_fail(ip)
@@ -1244,7 +1300,7 @@ def teacher_students(request: Request):
 def teacher_add_student_page(request: Request, error: str = ""):
     teacher = _require_teacher(request)
     if not teacher: return RedirectResponse("/teacher/login", status_code=303)
-    err = f'<div class="alert alert-danger">{error}</div>' if error else ""
+    err = f'<div class="alert alert-danger">{_esc(error)}</div>' if error else ""
     content = f"""
 <div style="max-width:480px;">
   <h1 style="margin-bottom:20px;">Add Student</h1>
@@ -1309,7 +1365,7 @@ def teacher_student_detail(student_id: str, request: Request, toast: str = ""):
         f'<div style="padding:12px 0;border-bottom:1px solid var(--border);">'
         f'<div style="font-size:11px;color:var(--muted);">{n.get("date","")}</div>'
         f'<div style="font-size:13px;margin-top:4px;">{n.get("notes","")}</div>'
-        + (f'<div style="font-size:12px;color:var(--success);margin-top:4px;"><strong>Assignment:</strong> {n["assignment"]}</div>' if n.get("assignment","").strip() else "")
+        + (f'<div style="font-size:12px;color:var(--success);margin-top:4px;"><strong>Assignment:</strong> {_esc(n["assignment"])}</div>' if n.get("assignment","").strip() else "")
         + '</div>'
         for n in notes[:5]
     ) or '<p style="color:var(--muted);font-size:13px;">No notes yet.</p>'
@@ -1321,7 +1377,7 @@ def teacher_student_detail(student_id: str, request: Request, toast: str = ""):
     att_pct    = f"{confirmed/(confirmed+missed)*100:.0f}%" if (confirmed+missed) > 0 else "—"
     credits    = sum(1 for r in att if r["status"] == "Cancelled")
 
-    t_html = f'<div class="alert alert-success">{toast}</div>' if toast else ""
+    t_html = f'<div class="alert alert-success">{_esc(toast)}</div>' if toast else ""
     content = f"""
 {t_html}
 <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:10px;">
@@ -1861,7 +1917,7 @@ def parent_dashboard(request: Request):
             f'<div class="card" style="border-color:#a5b4fc;">'
             f'<h3>📌 Latest Note — {latest.get("date","")}</h3>'
             f'<p style="font-size:13px;margin:8px 0;">{latest.get("notes","")}</p>'
-            + (f'<div style="background:#f0fdf4;border-left:3px solid #10b981;padding:8px 12px;border-radius:0 6px 6px 0;font-size:13px;"><strong>Assignment:</strong> {latest["assignment"]}</div>' if latest.get("assignment","").strip() else "")
+            + (f'<div style="background:#f0fdf4;border-left:3px solid #10b981;padding:8px 12px;border-radius:0 6px 6px 0;font-size:13px;"><strong>Assignment:</strong> {_esc(latest["assignment"])}</div>' if latest.get("assignment","").strip() else "")
             + "</div>"
         )
 
@@ -1895,8 +1951,8 @@ def parent_notes(request: Request):
     notes_html = "".join(
         f'<div style="padding:16px;border:1px solid var(--border);border-radius:10px;margin-bottom:12px;">'
         f'<div style="font-size:11px;color:var(--muted);margin-bottom:6px;">{n.get("date","")}</div>'
-        + (f'<p style="margin:0 0 10px;font-size:13px;">{n["notes"]}</p>' if n.get("notes","").strip() else "")
-        + (f'<div style="background:#f0fdf4;border-left:3px solid #10b981;padding:8px 12px;border-radius:0 6px 6px 0;font-size:13px;"><strong>Assignment:</strong> {n["assignment"]}</div>' if n.get("assignment","").strip() else "")
+        + (f'<p style="margin:0 0 10px;font-size:13px;">{_esc(n["notes"])}</p>' if n.get("notes","").strip() else "")
+        + (f'<div style="background:#f0fdf4;border-left:3px solid #10b981;padding:8px 12px;border-radius:0 6px 6px 0;font-size:13px;"><strong>Assignment:</strong> {_esc(n["assignment"])}</div>' if n.get("assignment","").strip() else "")
         + '</div>'
         for n in notes
     ) or '<p style="color:var(--muted);">No notes yet.</p>'
@@ -1983,10 +2039,14 @@ async def mobile_school_login(request: Request):
     email  = data.get("email", "").strip().lower()
     pw     = data.get("password", "")
     school = get_school_by_email(email)
-    if school and school["password_hash"] == _hash(pw):
+    if school and _check_password(pw, school["password_hash"]):
         _rl_clear(ip)
+        stored = school["password_hash"]
+        if _needs_rehash(stored):
+            stored = _hash_password(pw)
+            _update_school(school["school_id"], password_hash=stored)
         return JSONResponse({"ok": True,
-                             "session": issue_token("school", school["school_id"], school["password_hash"]),
+                             "session": issue_token("school", school["school_id"], stored),
                              "school_name": school["name"], "role": "school"})
     _rl_fail(ip)
     return JSONResponse({"ok": False, "error": "Invalid credentials"}, status_code=401)
@@ -2058,10 +2118,14 @@ async def mobile_teacher_login(request: Request):
     email   = data.get("email", "").strip().lower()
     pw      = data.get("password", "")
     teacher = get_teacher_by_email(email)
-    if teacher and teacher["password_hash"] == _hash(pw) and teacher.get("active","true") == "true":
+    if teacher and teacher.get("active","true") == "true" and _check_password(pw, teacher["password_hash"]):
         _rl_clear(ip)
+        stored = teacher["password_hash"]
+        if _needs_rehash(stored):
+            stored = _hash_password(pw)
+            _update_teacher(teacher["teacher_id"], password_hash=stored)
         return JSONResponse({"ok": True,
-                             "session": issue_token("teacher", teacher["teacher_id"], teacher["password_hash"]),
+                             "session": issue_token("teacher", teacher["teacher_id"], stored),
                              "name": teacher["name"], "role": "teacher"})
     _rl_fail(ip)
     return JSONResponse({"ok": False, "error": "Invalid credentials"}, status_code=401)
@@ -2530,11 +2594,11 @@ def school_policies_page(request: Request, toast: str = ""):
     policies = [p for p in _read_csv(POLICIES_FILE, POLICIES_HEADERS)
                 if p["school_id"] == school["school_id"]]
     sigs     = _read_csv(SIGNATURES_FILE, SIGNATURES_HEADERS)
-    toast_html = f'<div class="alert alert-success">{toast}</div>' if toast else ""
+    toast_html = f'<div class="alert alert-success">{_esc(toast)}</div>' if toast else ""
     rows = ""
     for p in policies:
         signed_count = len([s for s in sigs if s["policy_id"] == p["id"]])
-        rows += (f'<tr><td><strong>{p["title"]}</strong></td>'
+        rows += (f'<tr><td><strong>{_esc(p["title"])}</strong></td>'
                  f'<td>{p["created_at"][:10]}</td>'
                  f'<td><span class="badge badge-info">{signed_count} signed</span></td>'
                  f'<td><a class="btn btn-sm btn-outline" href="/school/policies/{p["id"]}/sigs">View Signatures</a></td></tr>')
@@ -2602,7 +2666,7 @@ def policy_signatures(request: Request, policy_id: str):
             rows += (f'<tr><td>{stu["name"]}</td>'
                      f'<td><span class="badge badge-danger">Not signed</span></td></tr>')
     content = f"""
-    <h1>📋 {policy["title"]} — Signatures</h1>
+    <h1>📋 {_esc(policy["title"])} — Signatures</h1>
     <div class="card">
       <table><thead><tr><th>Student</th><th>Status</th></tr></thead>
       <tbody>{rows or "<tr><td colspan=2>No students found.</td></tr>"}</tbody></table>
@@ -2632,7 +2696,7 @@ def policy_sign_page(request: Request, policy_id: str, code: str = ""):
                 already_signed = f'<div class="alert alert-success">✓ Already signed on {existing["signed_at"][:10]}.</div>'
     return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset=UTF-8>
     <meta name=viewport content="width=device-width,initial-scale=1">
-    <title>Sign Policy — {policy["title"]}</title>
+    <title>Sign Policy — {_esc(policy["title"])}</title>
     <style>
       body{{font-family:-apple-system,sans-serif;background:#f8faff;padding:24px;max-width:640px;margin:0 auto;}}
       h1{{font-size:22px;font-weight:800;margin-bottom:8px;color:#1e293b;}}
@@ -2648,9 +2712,9 @@ def policy_sign_page(request: Request, policy_id: str, code: str = ""):
       .alert-success{{background:#d1fae5;color:#065f46;border:1px solid #a7f3d0;
                       padding:12px 16px;border-radius:9px;margin-bottom:14px;font-weight:600;}}
     </style></head><body>
-    <h1>📋 {policy["title"]}</h1>
+    <h1>📋 {_esc(policy["title"])}</h1>
     <p style="color:#64748b;font-size:14px;">Please read and sign this policy from {policy["school_id"]}.</p>
-    <div class="policy-body">{policy["body"]}</div>
+    <div class="policy-body">{_esc(policy["body"])}</div>
     {already_signed}
     <form method="post" action="/sign/{policy_id}">
       <div class="form-group">
@@ -2693,7 +2757,7 @@ async def policy_sign_post(request: Request, policy_id: str, code: str = Form(..
     <div style="margin-top:60px;">
       <div style="font-size:64px;margin-bottom:16px;">✅</div>
       <h1 style="font-size:22px;font-weight:800;color:#1e293b;margin-bottom:8px;">Signed!</h1>
-      <p style="color:#64748b;">Thank you, {student["name"]}. Your signature has been recorded.</p>
+      <p style="color:#64748b;">Thank you, {_esc(student["name"])}. Your signature has been recorded.</p>
     </div></body></html>""")
 
 
