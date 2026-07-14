@@ -170,7 +170,8 @@ LEDGER_FILE   = "/data/ledger.csv"
 NOTES_FILE    = "/data/notes.csv"
 
 SCHOOLS_HEADERS  = ["school_id", "name", "owner_email", "owner_name", "password_hash",
-                    "plan", "created_at", "active", "trial_ends", "is_subscribed"]
+                    "plan", "created_at", "active", "trial_ends", "is_subscribed",
+                    "stripe_customer_id", "subscription_status"]
 TEACHERS_HEADERS = ["teacher_id", "school_id", "name", "email", "password_hash",
                     "created_at", "active"]
 STUDENTS_HEADERS = ["student_id", "school_id", "teacher_id", "name", "rate",
@@ -223,8 +224,10 @@ def _migrate_schools():
         rows   = [dict(row) for row in r]
     if not set(SCHOOLS_HEADERS).issubset(set(fields)):
         for row in rows:
-            row.setdefault("trial_ends",    "")
-            row.setdefault("is_subscribed", "true")
+            row.setdefault("trial_ends",          "")
+            row.setdefault("is_subscribed",       "true")
+            row.setdefault("stripe_customer_id",  "")
+            row.setdefault("subscription_status", "")
         _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, rows)
 
 _migrate_schools()
@@ -780,7 +783,18 @@ def school_dashboard(request: Request):
     _, reason = school_has_access(school)
     days_left  = school_trial_days(school)
     trial_banner = ""
-    if reason == "trial" and days_left <= 10:
+    if school.get("subscription_status", "") in ("past_due", "unpaid"):
+        trial_banner = (
+            '<div style="background:#2a1414;border:1px solid #ef4444;border-radius:10px;'
+            'padding:12px 16px;margin-bottom:16px;display:flex;align-items:center;'
+            'justify-content:space-between;flex-wrap:wrap;gap:10px;">'
+            '<span style="color:#ef4444;font-size:14px;font-weight:600;">'
+            '⚠️ Your last payment failed. Update your card to avoid losing access.</span>'
+            '<a href="/school/settings" style="padding:6px 14px;background:#6366f1;color:#fff;'
+            'border-radius:8px;font-size:13px;font-weight:700;text-decoration:none;">Update Payment Method</a>'
+            '</div>'
+        )
+    elif reason == "trial" and days_left <= 10:
         color = "#f59e0b" if days_left > 5 else "#ef4444"
         trial_banner = (
             f'<div style="background:#1c1410;border:1px solid {color};border-radius:10px;'
@@ -1119,9 +1133,13 @@ def school_settings(request: Request, toast: str = ""):
     t = f'<div class="alert alert-success">{_esc(toast)}</div>' if toast else ""
     has_access, reason = school_has_access(school)
     days_left = school_trial_days(school)
-    if reason == "subscribed":
+    sub_status = school.get("subscription_status", "")
+    if reason == "subscribed" and sub_status in ("past_due", "unpaid"):
+        billing_status = '<span style="color:#ef4444;font-weight:700;">⚠️ Payment failed — update your card</span>'
+        billing_action = '<form action="/school/billing/portal" method="post" style="margin:0;"><button type="submit" class="btn btn-sm" style="background:#ef4444;color:#fff;border:none;">Update Payment Method</button></form>'
+    elif reason == "subscribed":
         billing_status = '<span style="color:#10b981;font-weight:700;">✅ Active subscription — $99/month</span>'
-        billing_action = '<a href="/school/billing" class="btn btn-outline btn-sm">Manage Subscription</a>'
+        billing_action = '<form action="/school/billing/portal" method="post" style="margin:0;"><button type="submit" class="btn btn-outline btn-sm">Manage Subscription</button></form>'
     elif reason == "trial":
         billing_status = f'<span style="color:#f59e0b;font-weight:700;">🕐 Free trial — {days_left} day{"s" if days_left != 1 else ""} left</span>'
         billing_action = '<a href="/school/subscribe" class="btn btn-sm" style="background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border:none;">Add Card — $99/mo after trial</a>'
@@ -2528,28 +2546,49 @@ async def billing_webhook(request: Request):
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
-    if event["type"] in ("checkout.session.completed",
-                          "customer.subscription.updated"):
-        meta      = event["data"]["object"].get("metadata", {})
+    obj = event["data"]["object"]
+
+    if event["type"] == "checkout.session.completed":
+        meta      = obj.get("metadata", {})
         school_id = meta.get("school_id")
         plan      = meta.get("plan", "school")
         if school_id:
             schools = _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
             for s in schools:
                 if s["school_id"] == school_id:
-                    s["plan"]          = plan
-                    s["is_subscribed"] = "true"
+                    s["plan"]                = plan
+                    s["is_subscribed"]        = "true"
+                    s["subscription_status"]  = "active"
+                    # Capture this school's OWN Stripe customer id — not a
+                    # shared/global one — so the billing portal and any
+                    # re-checkout attach to the correct customer.
+                    if obj.get("customer"):
+                        s["stripe_customer_id"] = obj.get("customer", "")
+            _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, schools)
+
+    elif event["type"] == "customer.subscription.updated":
+        # data.object here is the Subscription itself, whose metadata only
+        # exists because subscription_data.metadata was set at checkout.
+        meta      = obj.get("metadata", {})
+        school_id = meta.get("school_id")
+        status    = obj.get("status", "active")
+        if school_id:
+            schools = _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
+            for s in schools:
+                if s["school_id"] == school_id:
+                    s["subscription_status"] = status
             _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, schools)
 
     elif event["type"] == "customer.subscription.deleted":
-        meta      = event["data"]["object"].get("metadata", {})
+        meta      = obj.get("metadata", {})
         school_id = meta.get("school_id")
         if school_id:
             schools = _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
             for s in schools:
                 if s["school_id"] == school_id:
-                    s["plan"]          = "inactive"
-                    s["is_subscribed"] = "false"
+                    s["plan"]                = "inactive"
+                    s["is_subscribed"]        = "false"
+                    s["subscription_status"]  = "cancelled"
             _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, schools)
 
     return JSONResponse({"ok": True})
@@ -2596,19 +2635,49 @@ async def school_billing_checkout(request: Request, plan: str = Form(...)):
     stripe.api_key = STRIPE_SECRET_KEY
     base = "https://music-school-app-hde7.onrender.com"
     try:
-        session = stripe.checkout.Session.create(
+        kwargs = dict(
             mode="subscription",
             line_items=[{"price": price_id, "quantity": 1}],
-            customer_email=school["owner_email"],
             metadata={"school_id": school["school_id"], "plan": plan},
             subscription_data={"trial_period_days": 30, "metadata": {"school_id": school["school_id"]}},
             payment_method_collection="always",
             success_url=f"{base}/school/subscribe?success={{CHECKOUT_SESSION_ID}}",
             cancel_url=f"{base}/school/subscribe?cancelled=1",
         )
+        # Reuse this school's OWN Stripe customer if they have one (e.g.
+        # resubscribing after a cancellation), rather than creating a
+        # duplicate customer from customer_email every time.
+        existing_customer_id = school.get("stripe_customer_id", "")
+        if existing_customer_id:
+            kwargs["customer"] = existing_customer_id
+        else:
+            kwargs["customer_email"] = school["owner_email"]
+        session = stripe.checkout.Session.create(**kwargs)
         return RedirectResponse(session.url, status_code=303)
     except Exception as e:
         return RedirectResponse(f"/school/subscribe?cancelled=1&toast={str(e)[:80]}", status_code=303)
+
+
+@app.post("/school/billing/portal")
+async def school_billing_portal(request: Request):
+    """Opens the Stripe-hosted Customer Portal for this school: update
+    payment method, view invoices, or cancel — without us building any of
+    that UI ourselves."""
+    school = _require_school(request)
+    if not school: return RedirectResponse("/school/login", status_code=303)
+    customer_id = school.get("stripe_customer_id", "")
+    if not STRIPE_SECRET_KEY or not customer_id:
+        return RedirectResponse("/school/settings?toast=No+billing+account+found.+Subscribe+first.", status_code=303)
+    stripe.api_key = STRIPE_SECRET_KEY
+    base = "https://music-school-app-hde7.onrender.com"
+    try:
+        portal = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url=f"{base}/school/settings",
+        )
+        return RedirectResponse(portal.url, status_code=303)
+    except Exception as e:
+        return RedirectResponse(f"/school/settings?toast=Could+not+open+billing+portal", status_code=303)
 
 
 # ── Policy signing ─────────────────────────────────────────────────────────────
@@ -2820,17 +2889,43 @@ async def mobile_school_billing_checkout(request: Request):
         return JSONResponse({"ok": False, "error": "unknown plan"}, status_code=400)
     stripe.api_key = STRIPE_SECRET_KEY
     try:
-        session = stripe.checkout.Session.create(
+        kwargs = dict(
             mode="subscription",
             line_items=[{"price": price_id, "quantity": 1}],
-            customer_email=school["owner_email"],
             metadata={"school_id": school["school_id"], "plan": plan},
             subscription_data={"trial_period_days": 30, "metadata": {"school_id": school["school_id"]}},
             payment_method_collection="always",
             success_url=f"https://music-school-app-hde7.onrender.com/school/subscribe?success={{CHECKOUT_SESSION_ID}}",
             cancel_url=f"https://music-school-app-hde7.onrender.com/school/subscribe?cancelled=1",
         )
+        existing_customer_id = school.get("stripe_customer_id", "")
+        if existing_customer_id:
+            kwargs["customer"] = existing_customer_id
+        else:
+            kwargs["customer_email"] = school["owner_email"]
+        session = stripe.checkout.Session.create(**kwargs)
         return JSONResponse({"ok": True, "url": session.url})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.post("/api/mobile/school/billing/portal")
+async def mobile_school_billing_portal(request: Request):
+    """Opens the Stripe-hosted Customer Portal — used when the school is
+    already subscribed and taps 'Manage Subscription', instead of running
+    a brand new checkout session on top of an active subscription."""
+    school = _school_auth(request)
+    if not school: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    customer_id = school.get("stripe_customer_id", "")
+    if not STRIPE_SECRET_KEY or not customer_id:
+        return JSONResponse({"ok": False, "error": "No billing account found. Subscribe first."}, status_code=400)
+    stripe.api_key = STRIPE_SECRET_KEY
+    try:
+        portal = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url="https://music-school-app-hde7.onrender.com/school/dashboard",
+        )
+        return JSONResponse({"ok": True, "url": portal.url})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
