@@ -61,6 +61,7 @@ async def csrf_origin_middleware(request: Request, call_next):
 _MOBILE_SUB_GATE_EXEMPT = {
     "/api/mobile/school/login", "/api/mobile/teacher/login",
     "/api/mobile/school/billing/checkout", "/api/mobile/school/billing/portal",
+    "/api/mobile/school/billing/confirm",
     "/api/mobile/school/subscription-status", "/api/mobile/teacher/subscription-status",
 }
 
@@ -3112,8 +3113,12 @@ async def mobile_school_billing_checkout(request: Request):
             metadata={"school_id": school["school_id"], "plan": plan},
             subscription_data={"trial_period_days": 30, "metadata": {"school_id": school["school_id"]}},
             payment_method_collection="always",
-            success_url=f"https://music-school-app-hde7.onrender.com/school/subscribe?success={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"https://music-school-app-hde7.onrender.com/school/subscribe?cancelled=1",
+            # Custom URL scheme, not a web page — the mobile client opens
+            # this in an auth-session browser (expo-web-browser) that
+            # resolves in-app when Stripe redirects here, instead of
+            # stranding the user in a bare external browser tab.
+            success_url="studioconsole://ms-billing-return?session_id={CHECKOUT_SESSION_ID}",
+            cancel_url="studioconsole://ms-billing-return?cancelled=1",
         )
         existing_customer_id = school.get("stripe_customer_id", "")
         if existing_customer_id:
@@ -3124,6 +3129,37 @@ async def mobile_school_billing_checkout(request: Request):
         return JSONResponse({"ok": True, "url": session.url})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.post("/api/mobile/school/billing/confirm")
+async def mobile_school_billing_confirm(request: Request):
+    """Verifies a completed checkout directly with Stripe and flips
+    is_subscribed immediately, rather than waiting on the webhook."""
+    school = _school_auth(request)
+    if not school: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    data = await request.json()
+    session_id = data.get("session_id", "")
+    if not session_id or not STRIPE_SECRET_KEY:
+        return JSONResponse({"ok": False, "error": "invalid request"}, status_code=400)
+    stripe.api_key = STRIPE_SECRET_KEY
+    try:
+        sess = stripe.checkout.Session.retrieve(session_id)
+        paid = sess.get("payment_status") in ("paid", "no_payment_required") or sess.get("status") == "complete"
+        if paid:
+            schools = _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
+            for s in schools:
+                if s["school_id"] == school["school_id"]:
+                    s["is_subscribed"]        = "true"
+                    s["subscription_status"]  = "active"
+                    s["plan"]                 = "school"
+                    if sess.get("customer"):
+                        s["stripe_customer_id"] = sess.get("customer", "")
+            _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, schools)
+        updated_school = get_school(school["school_id"])
+        has_access, reason = school_has_access(updated_school)
+        return JSONResponse({"ok": True, "confirmed": paid, "active": has_access, "reason": reason})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)[:300]}, status_code=500)
 
 
 @app.post("/api/mobile/school/billing/portal")
