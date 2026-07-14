@@ -538,6 +538,145 @@ def root():
     return RedirectResponse("/school/login")
 
 
+def _legal_page(title: str, body_html: str) -> str:
+    return f"""<!DOCTYPE html><html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title} — Music School App</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  body{{font-family:'Inter',-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;
+       max-width:760px;margin:0 auto;padding:48px 24px 80px;line-height:1.7;}}
+  h1{{font-size:28px;font-weight:800;margin-bottom:6px;color:#f0f4ff;}}
+  .updated{{color:#64748b;font-size:13px;margin-bottom:36px;}}
+  h2{{font-size:19px;font-weight:700;margin:32px 0 10px;color:#f0f4ff;}}
+  p,li{{color:#cbd5e1;font-size:15px;}}
+  ul{{padding-left:22px;margin-bottom:14px;}}
+  li{{margin-bottom:6px;}}
+  a{{color:#818cf8;}}
+  .back{{display:inline-block;margin-bottom:28px;color:#818cf8;text-decoration:none;font-size:14px;font-weight:600;}}
+  .notice{{background:#1e1b3a;border:1px solid #4c1d95;border-radius:10px;padding:14px 18px;
+          margin-bottom:28px;font-size:13px;color:#c4b5fd;}}
+</style></head><body>
+<a href="/school/login" class="back">← Back to login</a>
+{body_html}
+</body></html>"""
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy_page():
+    body = """
+<h1>Privacy Policy</h1>
+<div class="updated">Last updated: [DATE — fill in before launch]</div>
+<div class="notice">⚠️ Placeholder: replace [Your Business Name], [contact email], and [DATE] below before this page goes live, and have a lawyer review this before relying on it for compliance.</div>
+
+<p>This Privacy Policy explains how [Your Business Name] ("we", "us") collects, uses, and protects information through Music School App (the "Service"), a tool for music schools to manage teachers, students, lessons, attendance, and payments.</p>
+
+<h2>Who uses this Service</h2>
+<p>Music School App is used by a school administrator to manage their school. The school admin invites teachers, who each manage their own roster of students. Parents may be given a separate login (an access code) by their child's teacher to view lesson notes, attendance, and make payments, and to review and sign school policies.</p>
+
+<h2>Information we collect</h2>
+<ul>
+  <li><strong>School and teacher account data:</strong> school name, owner name/email, teacher name/email, password (stored as a salted hash, never in plain text), subscription status.</li>
+  <li><strong>Student data, entered by the school or teacher:</strong> student name, lesson notes, assignments, attendance records, and payment/balance information.</li>
+  <li><strong>Parent data:</strong> parent email/access codes used to log in to the parent portal, and policy signatures.</li>
+  <li><strong>Payment information:</strong> processed entirely by Stripe. We never see or store full card numbers.</li>
+  <li><strong>Usage data:</strong> basic page-view logs and feature-usage events, used only to improve the product.</li>
+</ul>
+
+<h2>Children's data and COPPA</h2>
+<p>Most students managed through this Service are children under 13. We do not knowingly collect information directly from children through this Service — all student information is entered by the school or teacher as part of managing music lessons, not through any interaction by the child with the Service itself. The school is responsible for its own relationship with students and parents, and for any consent required under applicable law (including COPPA) for the information it chooses to enter about a student.</p>
+<p>Parents may contact their child's school at any time to review, correct, or request deletion of their child's information. If you are a parent with a privacy concern we can help with directly, contact us at [contact email].</p>
+
+<h2>How we use information</h2>
+<ul>
+  <li>To operate the Service: storing and displaying lesson notes, schedules, attendance, and payment records across a school's teachers and students.</li>
+  <li>To process subscription payments via Stripe.</li>
+  <li>To send transactional emails (teacher invites, confirmations, invoices) via SendGrid.</li>
+  <li>To send push notifications for lesson reminders and note updates, if enabled.</li>
+  <li>To maintain backups for disaster recovery (stored with Cloudflare R2).</li>
+</ul>
+
+<h2>Who we share data with</h2>
+<p>We use the following service providers (sub-processors) to operate the Service. We do not sell your data.</p>
+<ul>
+  <li><strong>Stripe</strong> — payment processing</li>
+  <li><strong>SendGrid</strong> — transactional email delivery</li>
+  <li><strong>Cloudflare R2</strong> — encrypted off-site backup storage</li>
+  <li><strong>Render</strong> — application hosting</li>
+</ul>
+
+<h2>Data retention and deletion</h2>
+<p>We retain school, teacher, and student data for as long as the school's account is active. A school admin can remove teachers, and teachers can remove students, at any time. To request deletion of a school's account or data, email [contact email]; we will process deletion requests within a reasonable time, subject to what we need to retain for legal, tax, or dispute-resolution purposes.</p>
+
+<h2>Security</h2>
+<p>Passwords are hashed with bcrypt. Sessions use signed, time-limited tokens. Data is encrypted in transit (HTTPS). Backups are stored off-site and access-restricted. No system is perfectly secure, and we cannot guarantee absolute security.</p>
+
+<h2>Your choices</h2>
+<p>School admins and teachers can update or delete their own account information at any time from Settings. Parents should contact their child's school or teacher to update or remove information, since the school controls that data.</p>
+
+<h2>Changes to this policy</h2>
+<p>We may update this policy from time to time. Material changes will be reflected by updating the "Last updated" date above.</p>
+
+<h2>Contact</h2>
+<p>Questions about this policy: [contact email]</p>
+"""
+    return HTMLResponse(_legal_page("Privacy Policy", body))
+
+
+@app.get("/terms", response_class=HTMLResponse)
+def terms_page():
+    body = """
+<h1>Terms of Service</h1>
+<div class="updated">Last updated: [DATE — fill in before launch]</div>
+<div class="notice">⚠️ Placeholder: replace [Your Business Name], [contact email], [governing state/country], and [DATE] before this page goes live, and have a lawyer review this before relying on it.</div>
+
+<p>These Terms of Service ("Terms") govern your use of Music School App (the "Service"), operated by [Your Business Name] ("we", "us"). By creating a school account, you agree to these Terms on behalf of your school.</p>
+
+<h2>The Service</h2>
+<p>Music School App is a subscription tool for music schools to manage teachers, students, scheduling, attendance, lesson notes, and payments. You are responsible for the accuracy of the information entered by your school and its teachers, and for your own compliance with any laws that apply to your school, including obligations to your students and their parents.</p>
+
+<h2>Accounts</h2>
+<p>The school admin is responsible for inviting and managing teacher accounts, and for all activity under the school's account, including actions taken by teachers the school has invited. Parent portal access is granted by the school or teacher, who is responsible for managing who has access.</p>
+
+<h2>Subscription, trial, and billing</h2>
+<ul>
+  <li>New school accounts receive a 30-day free trial with full access.</li>
+  <li>A valid payment card is required to start a trial. You will not be charged during the trial.</li>
+  <li>After the trial ends, your card will be charged $99/month unless you cancel first.</li>
+  <li>You can cancel anytime from Settings; cancellation takes effect at the end of the current billing period, and you will not be charged again.</li>
+  <li>Fees are non-refundable except where required by law.</li>
+</ul>
+
+<h2>Acceptable use</h2>
+<p>You agree not to use the Service to store or transmit unlawful content, to attempt to gain unauthorized access to other schools' accounts or our systems, or to use the Service in a way that could harm students, parents, or other users.</p>
+
+<h2>Your content</h2>
+<p>Your school retains ownership of the student, lesson, and payment data entered by its teachers. You grant us the right to store and process it solely to provide the Service to your school. Your school is responsible for having any necessary rights or consents to enter information about its students and their parents.</p>
+
+<h2>Data export and account closure</h2>
+<p>Your school admin can download a backup of school data at any time from Settings. If your school closes its account, we will delete its data within a reasonable period, subject to backup retention and legal requirements.</p>
+
+<h2>Disclaimers</h2>
+<p>The Service is provided "as is" without warranties of any kind. We do not guarantee the Service will be uninterrupted or error-free. We are not responsible for disputes between your school and its teachers, students, or their parents.</p>
+
+<h2>Limitation of liability</h2>
+<p>To the maximum extent permitted by law, our total liability for any claim arising from your use of the Service is limited to the amount your school paid us in the 12 months before the claim arose.</p>
+
+<h2>Termination</h2>
+<p>We may suspend or terminate accounts that violate these Terms or that we reasonably believe pose a risk to the Service or other users.</p>
+
+<h2>Governing law</h2>
+<p>These Terms are governed by the laws of [governing state/country], without regard to conflict-of-law principles.</p>
+
+<h2>Changes to these Terms</h2>
+<p>We may update these Terms from time to time. Continued use of the Service after a change constitutes acceptance of the updated Terms.</p>
+
+<h2>Contact</h2>
+<p>Questions about these Terms: [contact email]</p>
+"""
+    return HTMLResponse(_legal_page("Terms of Service", body))
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SCHOOL ADMIN — signup / login / dashboard
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -579,6 +718,11 @@ def school_signup_page(error: str = ""):
       <button type="submit" class="btn" style="width:100%;justify-content:center;padding:10px;margin-top:4px;">
         Create School</button>
     </form>
+    <p style="text-align:center;margin-top:12px;font-size:12px;color:var(--muted);">
+      By creating an account you agree to our
+      <a href="/terms" target="_blank" style="color:var(--primary);">Terms of Service</a> and
+      <a href="/privacy" target="_blank" style="color:var(--primary);">Privacy Policy</a>.
+    </p>
     <p style="text-align:center;margin-top:14px;font-size:13px;color:var(--muted);">
       Already have an account? <a href="/school/login" style="color:var(--primary);font-weight:600;">Sign in</a>
     </p>
@@ -760,7 +904,11 @@ def school_subscribe_page(request: Request, success: str = "", cancelled: str = 
     </div>
   </div>
   <div style="text-align:center;margin-top:16px;">
-    <a href="/school/logout" style="color:#475569;font-size:13px;text-decoration:none;">Log out</a>
+    <a href="/terms" target="_blank" style="color:#475569;font-size:12px;text-decoration:none;">Terms</a>
+    <span style="color:#475569;font-size:12px;"> · </span>
+    <a href="/privacy" target="_blank" style="color:#475569;font-size:12px;text-decoration:none;">Privacy</a>
+    <span style="color:#475569;font-size:12px;"> · </span>
+    <a href="/school/logout" style="color:#475569;font-size:12px;text-decoration:none;">Log out</a>
   </div>
 </div>"""
     return HTMLResponse(f"""<!DOCTYPE html><html lang="en">
