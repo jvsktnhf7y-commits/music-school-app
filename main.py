@@ -237,6 +237,68 @@ def school_trial_days(school: dict) -> int:
         return 0
 
 
+# ── Signed session tokens ──────────────────────────────────────────────────────
+from itsdangerous import URLSafeTimedSerializer
+
+SECRET_KEY_FILE      = "/data/secret_key"
+TOKEN_MAX_AGE_WEB    = 30 * 86400
+TOKEN_MAX_AGE_MOBILE = 90 * 86400
+
+def _load_secret_key() -> str:
+    key = os.environ.get("SECRET_KEY", "")
+    if key:
+        return key
+    if os.path.exists(SECRET_KEY_FILE):
+        with open(SECRET_KEY_FILE) as f:
+            return f.read().strip()
+    key = secrets.token_hex(32)
+    with open(SECRET_KEY_FILE, "w") as f:
+        f.write(key)
+    return key
+
+_token_signer = URLSafeTimedSerializer(_load_secret_key(), salt="ms-auth")
+
+def _cred_fp(credential: str) -> str:
+    return hashlib.sha256((credential or "").encode()).hexdigest()[:12]
+
+def _current_credential(role: str, subject: str) -> str | None:
+    """Live credential the token fingerprint must match — rotating it
+    (password change, parent-code regen) invalidates outstanding tokens."""
+    if role == "school":
+        s = get_school(subject)
+        return s.get("password_hash") if s else None
+    if role == "teacher":
+        t = get_teacher(subject)
+        return t.get("password_hash") if t and t.get("active", "true") == "true" else None
+    if role == "parent":
+        st = get_student(subject)
+        return st.get("parent_code") if st else None
+    return None
+
+def issue_token(role: str, subject: str, credential: str) -> str:
+    return _token_signer.dumps({"r": role, "s": subject, "h": _cred_fp(credential)})
+
+def verify_token(token: str, expected_role: str, max_age: int) -> dict | None:
+    if not token:
+        return None
+    try:
+        payload = _token_signer.loads(token, max_age=max_age)
+    except Exception:
+        return None
+    if payload.get("r") != expected_role:
+        return None
+    cred = _current_credential(payload.get("r", ""), payload.get("s", ""))
+    if cred is None or _cred_fp(cred) != payload.get("h"):
+        return None
+    return payload
+
+def _bearer_payload(request: Request, role: str) -> dict | None:
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None
+    return verify_token(auth.removeprefix("Bearer ").strip(), role, TOKEN_MAX_AGE_MOBILE)
+
+
 # ── Teacher helpers ────────────────────────────────────────────────────────────
 def get_teachers(school_id: str) -> list[dict]:
     return [t for t in _read_csv(TEACHERS_FILE, TEACHERS_HEADERS)
@@ -475,7 +537,8 @@ async def school_signup_post(
         "is_subscribed": "false",
     })
     resp = RedirectResponse("/school/subscribe", status_code=303)
-    resp.set_cookie("school_id", school_id, httponly=True, max_age=86400 * 30)
+    resp.set_cookie("school_id", issue_token("school", school_id, _hash(password)),
+                    httponly=True, secure=True, samesite="lax", max_age=TOKEN_MAX_AGE_WEB)
     return resp
 
 
@@ -502,7 +565,8 @@ async def school_login_post(request: Request, email: str = Form(...), password: 
     if school and school["password_hash"] == _hash(password):
         _rl_clear(ip)
         resp = RedirectResponse("/school/dashboard", status_code=303)
-        resp.set_cookie("school_id", school["school_id"], httponly=True, max_age=86400 * 30)
+        resp.set_cookie("school_id", issue_token("school", school["school_id"], school["password_hash"]),
+                        httponly=True, secure=True, samesite="lax", max_age=TOKEN_MAX_AGE_WEB)
         return resp
     _rl_fail(ip)
     return RedirectResponse("/school/login?error=Invalid+email+or+password", status_code=303)
@@ -516,8 +580,8 @@ def school_logout():
 
 
 def _require_school(request: Request) -> dict | None:
-    sid = request.cookies.get("school_id", "")
-    return get_school(sid) if sid else None
+    payload = verify_token(request.cookies.get("school_id", ""), "school", TOKEN_MAX_AGE_WEB)
+    return get_school(payload["s"]) if payload else None
 
 def _school_access_response(school: dict) -> RedirectResponse | None:
     """Returns a redirect if school lacks access, else None."""
@@ -1051,7 +1115,11 @@ async def school_password_post(request: Request,
         if r["school_id"] == school["school_id"]:
             r["password_hash"] = _hash(new_password)
     _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, rows)
-    return RedirectResponse("/school/settings?toast=Password+updated", status_code=303)
+    # Password change invalidates all outstanding tokens; reissue this session's
+    resp = RedirectResponse("/school/settings?toast=Password+updated", status_code=303)
+    resp.set_cookie("school_id", issue_token("school", school["school_id"], _hash(new_password)),
+                    httponly=True, secure=True, samesite="lax", max_age=TOKEN_MAX_AGE_WEB)
+    return resp
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1079,7 +1147,8 @@ async def teacher_login_post(request: Request, email: str = Form(...), password:
     if teacher and teacher["password_hash"] == _hash(password) and teacher.get("active","true") == "true":
         _rl_clear(ip)
         resp = RedirectResponse("/teacher/dashboard", status_code=303)
-        resp.set_cookie("teacher_id", teacher["teacher_id"], httponly=True, max_age=86400 * 30)
+        resp.set_cookie("teacher_id", issue_token("teacher", teacher["teacher_id"], teacher["password_hash"]),
+                        httponly=True, secure=True, samesite="lax", max_age=TOKEN_MAX_AGE_WEB)
         return resp
     _rl_fail(ip)
     return RedirectResponse("/teacher/login?error=Invalid+email+or+password", status_code=303)
@@ -1093,8 +1162,8 @@ def teacher_logout():
 
 
 def _require_teacher(request: Request) -> dict | None:
-    tid = request.cookies.get("teacher_id", "")
-    return get_teacher(tid) if tid else None
+    payload = verify_token(request.cookies.get("teacher_id", ""), "teacher", TOKEN_MAX_AGE_WEB)
+    return get_teacher(payload["s"]) if payload else None
 
 
 @app.get("/teacher/dashboard", response_class=HTMLResponse)
@@ -1759,7 +1828,8 @@ async def parent_login_post(request: Request,
     if match:
         _rl_clear(ip)
         resp = RedirectResponse("/parent/dashboard", status_code=303)
-        resp.set_cookie("parent_student_id", match["student_id"], httponly=True, max_age=86400*30)
+        resp.set_cookie("parent_student_id", issue_token("parent", match["student_id"], match.get("parent_code", "")),
+                        httponly=True, secure=True, samesite="lax", max_age=TOKEN_MAX_AGE_WEB)
         return resp
     _rl_fail(ip)
     return RedirectResponse("/parent/login?error=Invalid+student+name+or+code", status_code=303)
@@ -1773,8 +1843,8 @@ def parent_logout():
 
 
 def _require_parent(request: Request) -> dict | None:
-    sid = request.cookies.get("parent_student_id","")
-    return get_student(sid) if sid else None
+    payload = verify_token(request.cookies.get("parent_student_id", ""), "parent", TOKEN_MAX_AGE_WEB)
+    return get_student(payload["s"]) if payload else None
 
 
 @app.get("/parent/dashboard", response_class=HTMLResponse)
@@ -1915,17 +1985,15 @@ async def mobile_school_login(request: Request):
     school = get_school_by_email(email)
     if school and school["password_hash"] == _hash(pw):
         _rl_clear(ip)
-        return JSONResponse({"ok": True, "session": school["school_id"],
+        return JSONResponse({"ok": True,
+                             "session": issue_token("school", school["school_id"], school["password_hash"]),
                              "school_name": school["name"], "role": "school"})
     _rl_fail(ip)
     return JSONResponse({"ok": False, "error": "Invalid credentials"}, status_code=401)
 
 def _school_auth(request: Request) -> dict | None:
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer school:"):
-        return None
-    sid = auth.removeprefix("Bearer school:").strip()
-    return get_school(sid)
+    payload = _bearer_payload(request, "school")
+    return get_school(payload["s"]) if payload else None
 
 @app.get("/api/mobile/school/dashboard")
 def mobile_school_dashboard(request: Request):
@@ -1992,17 +2060,15 @@ async def mobile_teacher_login(request: Request):
     teacher = get_teacher_by_email(email)
     if teacher and teacher["password_hash"] == _hash(pw) and teacher.get("active","true") == "true":
         _rl_clear(ip)
-        return JSONResponse({"ok": True, "session": teacher["teacher_id"],
+        return JSONResponse({"ok": True,
+                             "session": issue_token("teacher", teacher["teacher_id"], teacher["password_hash"]),
                              "name": teacher["name"], "role": "teacher"})
     _rl_fail(ip)
     return JSONResponse({"ok": False, "error": "Invalid credentials"}, status_code=401)
 
 def _teacher_auth(request: Request) -> dict | None:
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer teacher:"):
-        return None
-    tid = auth.removeprefix("Bearer teacher:").strip()
-    return get_teacher(tid)
+    payload = _bearer_payload(request, "teacher")
+    return get_teacher(payload["s"]) if payload else None
 
 @app.get("/api/mobile/teacher/dashboard")
 def mobile_teacher_dashboard(request: Request):
@@ -2188,17 +2254,15 @@ async def mobile_parent_login(request: Request):
                   if s["name"].lower() == name and s.get("parent_code", "") == code), None)
     if match:
         _rl_clear(ip)
-        return JSONResponse({"ok": True, "session": match["student_id"],
+        return JSONResponse({"ok": True,
+                             "session": issue_token("parent", match["student_id"], match.get("parent_code", "")),
                              "student_name": match["name"], "role": "parent"})
     _rl_fail(ip)
     return JSONResponse({"ok": False, "error": "Invalid name or code"}, status_code=401)
 
 def _parent_auth(request: Request) -> dict | None:
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer parent:"):
-        return None
-    sid = auth.removeprefix("Bearer parent:").strip()
-    return get_student(sid)
+    payload = _bearer_payload(request, "parent")
+    return get_student(payload["s"]) if payload else None
 
 @app.get("/api/mobile/parent/dashboard")
 def mobile_parent_dashboard(request: Request):
