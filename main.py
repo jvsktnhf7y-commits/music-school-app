@@ -2854,7 +2854,7 @@ POLICIES_FILE = "/data/policies.csv"
 SIGNATURES_FILE = "/data/signatures.csv"
 
 WAITLIST_HEADERS   = ["id", "email", "created_at"]
-POLICIES_HEADERS   = ["id", "school_id", "title", "body", "created_at"]
+POLICIES_HEADERS   = ["id", "school_id", "title", "body", "created_at", "pdf_filename"]
 SIGNATURES_HEADERS = ["id", "policy_id", "school_id", "student_id",
                       "student_name", "signed_at"]
 
@@ -2865,6 +2865,20 @@ PLAN_PRICES = {
 _init_csv(WAITLIST_FILE,   WAITLIST_HEADERS)
 _init_csv(POLICIES_FILE,   POLICIES_HEADERS)
 _init_csv(SIGNATURES_FILE, SIGNATURES_HEADERS)
+
+def _migrate_policies():
+    if not os.path.exists(POLICIES_FILE):
+        return
+    with open(POLICIES_FILE, "r") as f:
+        r      = csv.DictReader(f)
+        fields = list(r.fieldnames or [])
+        rows   = [dict(row) for row in r]
+    if not set(POLICIES_HEADERS).issubset(set(fields)):
+        for row in rows:
+            row.setdefault("pdf_filename", "")
+        _write_csv(POLICIES_FILE, POLICIES_HEADERS, rows)
+
+_migrate_policies()
 
 
 # ── Push helper: fire in background thread ─────────────────────────────────────
@@ -3121,7 +3135,8 @@ def school_policies_page(request: Request, toast: str = ""):
     rows = ""
     for p in policies:
         signed_count = len([s for s in sigs if s["policy_id"] == p["id"]])
-        rows += (f'<tr><td><strong>{_esc(p["title"])}</strong></td>'
+        pdf_badge = ' <span class="badge badge-info" style="margin-left:4px;">PDF</span>' if p.get("pdf_filename") else ''
+        rows += (f'<tr><td><strong>{_esc(p["title"])}</strong>{pdf_badge}</td>'
                  f'<td>{p["created_at"][:10]}</td>'
                  f'<td><span class="badge badge-info">{signed_count} signed</span></td>'
                  f'<td><a class="btn btn-sm btn-outline" href="/school/policies/{p["id"]}/sigs">View Signatures</a></td></tr>')
@@ -3135,14 +3150,18 @@ def school_policies_page(request: Request, toast: str = ""):
     <div class="card">{table}</div>
     <div class="card" style="max-width:600px;">
       <h2>Add Policy</h2>
-      <form method="post" action="/school/policies/add">
+      <form method="post" action="/school/policies/add" enctype="multipart/form-data">
         <div class="form-group">
           <label class="form-label">Title</label>
           <input type="text" name="title" placeholder="e.g. Studio Policy 2026" required>
         </div>
         <div class="form-group">
-          <label class="form-label">Policy Text</label>
-          <textarea name="body" rows="8" placeholder="Enter the full policy text..." required style="width:100%;padding:8px 11px;border:1.5px solid var(--border);border-radius:8px;font-size:13px;font-family:inherit;"></textarea>
+          <label class="form-label">Upload PDF (optional)</label>
+          <input type="file" name="pdf_file" accept=".pdf" style="color:var(--text);">
+        </div>
+        <div class="form-group">
+          <label class="form-label">— or — Policy Text</label>
+          <textarea name="body" rows="8" placeholder="Enter the full policy text..." style="width:100%;padding:8px 11px;border:1.5px solid var(--border);border-radius:8px;font-size:13px;font-family:inherit;"></textarea>
         </div>
         <button class="btn" type="submit">➕ Add Policy</button>
       </form>
@@ -3153,17 +3172,45 @@ def school_policies_page(request: Request, toast: str = ""):
 
 @app.post("/school/policies/add")
 async def school_add_policy(request: Request,
-                             title: str = Form(...), body: str = Form(...)):
+                             title: str = Form(...), body: str = Form(default=""),
+                             pdf_file: UploadFile = File(default=None)):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
     gate = _school_access_response(school)
     if gate: return gate
+    if not body.strip() and not (pdf_file and pdf_file.filename):
+        return RedirectResponse("/school/policies?toast=Add+policy+text+or+upload+a+PDF", status_code=303)
+    policy_id = secrets.token_hex(8)
+    pdf_filename = ""
+    if pdf_file and pdf_file.filename:
+        os.makedirs("/data/policy_pdfs", exist_ok=True)
+        contents = await pdf_file.read()
+        with open(f"/data/policy_pdfs/{policy_id}.pdf", "wb") as f:
+            f.write(contents)
+        pdf_filename = pdf_file.filename
     _append_csv(POLICIES_FILE, POLICIES_HEADERS, {
-        "id": secrets.token_hex(8), "school_id": school["school_id"],
+        "id": policy_id, "school_id": school["school_id"],
         "title": title.strip(), "body": body.strip(),
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "pdf_filename": pdf_filename,
     })
     return RedirectResponse("/school/policies?toast=Policy+added", status_code=303)
+
+
+@app.get("/policy-pdf/{policy_id}")
+def policy_pdf(policy_id: str):
+    """Public, same posture as the /sign/{policy_id} page it's embedded in —
+    the policy's own content isn't secret, only signing requires a valid
+    student access code."""
+    policy = next((p for p in _read_csv(POLICIES_FILE, POLICIES_HEADERS)
+                   if p["id"] == policy_id), None)
+    if not policy or not policy.get("pdf_filename"):
+        return HTMLResponse("<p>No PDF uploaded.</p>", status_code=404)
+    pdf_path = f"/data/policy_pdfs/{policy_id}.pdf"
+    if not os.path.exists(pdf_path):
+        return HTMLResponse("<p>No PDF uploaded.</p>", status_code=404)
+    from fastapi.responses import FileResponse
+    return FileResponse(pdf_path, media_type="application/pdf", filename=policy["pdf_filename"])
 
 
 @app.get("/school/policies/{policy_id}/sigs", response_class=HTMLResponse)
@@ -3217,6 +3264,10 @@ def policy_sign_page(request: Request, policy_id: str, code: str = ""):
                              and s["student_id"] == student["student_id"]), None)
             if existing:
                 already_signed = f'<div class="alert alert-success">✓ Already signed on {existing["signed_at"][:10]}.</div>'
+    if policy.get("pdf_filename"):
+        policy_body_html = f'<iframe src="/policy-pdf/{policy_id}" style="width:100%;height:420px;border:1px solid #e2e8f0;border-radius:12px;margin:16px 0;"></iframe>'
+    else:
+        policy_body_html = f'<div class="policy-body">{_esc(policy["body"])}</div>'
     return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset=UTF-8>
     <meta name=viewport content="width=device-width,initial-scale=1">
     <title>Sign Policy — {_esc(policy["title"])}</title>
@@ -3237,7 +3288,7 @@ def policy_sign_page(request: Request, policy_id: str, code: str = ""):
     </style></head><body>
     <h1>📋 {_esc(policy["title"])}</h1>
     <p style="color:#64748b;font-size:14px;">Please read and sign this policy from {policy["school_id"]}.</p>
-    <div class="policy-body">{_esc(policy["body"])}</div>
+    {policy_body_html}
     {already_signed}
     <form method="post" action="/sign/{policy_id}">
       <div class="form-group">
