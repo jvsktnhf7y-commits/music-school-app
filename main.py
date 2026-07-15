@@ -1,7 +1,7 @@
 from fastapi import FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-import os, csv, json, secrets, hashlib, time
+import os, csv, json, secrets, hashlib, time, re
 from datetime import datetime, timedelta
 
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
@@ -441,6 +441,120 @@ def get_all_school_students(school_id: str) -> list[dict]:
 def get_student(student_id: str) -> dict | None:
     return next((s for s in _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
                  if s["student_id"] == student_id), None)
+
+
+# ── Per-teacher calendar sync (iCal) ────────────────────────────────────────────
+# One JSON store keyed by teacher_id, mirroring push_tokens.json's pattern for
+# per-entity data that doesn't fit the flat CSV headers. Deliberately iCal-only
+# (no Google OAuth) for now — see chat: per-teacher Google OAuth needs a signed
+# state param and Google's sensitive-scope verification review before it can
+# safely serve real users across many teachers, which is an external, multi-
+# week dependency, not just code. iCal needs no OAuth and covers Google
+# Calendar, Apple Calendar, and Outlook the same way via their share links.
+TEACHER_CALENDARS_FILE = "/data/teacher_calendars.json"
+
+def _load_teacher_calendars() -> dict:
+    if not os.path.exists(TEACHER_CALENDARS_FILE):
+        return {}
+    try:
+        with open(TEACHER_CALENDARS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_teacher_calendars(data: dict):
+    with open(TEACHER_CALENDARS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def get_teacher_calendar_settings(teacher_id: str) -> dict:
+    defaults = {
+        "ical_url": "",
+        "lesson_keywords": ["lesson", "private", "student", "class", "music",
+                            "piano", "guitar", "violin", "drums", "voice"],
+        "show_all": True,
+    }
+    defaults.update(_load_teacher_calendars().get(teacher_id, {}))
+    return defaults
+
+def save_teacher_calendar_settings(teacher_id: str, settings: dict):
+    data = _load_teacher_calendars()
+    data[teacher_id] = {**get_teacher_calendar_settings(teacher_id), **settings}
+    _save_teacher_calendars(data)
+
+def _fetch_ical_events(ical_url: str, days: int = 28) -> list:
+    """Fetch events from an iCal URL, Google Calendar event-shaped output.
+    Ported from the Studio App's proven parser — same minimal VEVENT scanner."""
+    try:
+        import urllib.request as _ur
+        with _ur.urlopen(ical_url, timeout=10) as resp:
+            raw = resp.read().decode('utf-8', errors='ignore')
+        events = []
+        now    = datetime.now()
+        cutoff = now + timedelta(days=days)
+        for block in raw.split('BEGIN:VEVENT'):
+            if 'END:VEVENT' not in block:
+                continue
+            block = block[:block.index('END:VEVENT')]
+            def _field(name):
+                for line in block.splitlines():
+                    if line.startswith(name + ':') or line.startswith(name + ';'):
+                        return line.split(':', 1)[-1].strip()
+                return ''
+            summary = _field('SUMMARY')
+            dtstart = _field('DTSTART')
+            dtend   = _field('DTEND')
+            def _parse_dt(s):
+                s = s.replace('Z', '').replace('-', '').replace(':', '')
+                try:
+                    if len(s) == 8:
+                        return datetime.strptime(s, '%Y%m%d')
+                    return datetime.strptime(s[:15], '%Y%m%dT%H%M%S')
+                except Exception:
+                    return None
+            start_dt = _parse_dt(dtstart)
+            end_dt   = _parse_dt(dtend)
+            if not start_dt or not (now <= start_dt <= cutoff):
+                continue
+            is_allday = len(dtstart.replace('Z', '')) == 8
+            if is_allday:
+                start_val = {'date': start_dt.strftime('%Y-%m-%d')}
+                end_val   = {'date': (end_dt or start_dt).strftime('%Y-%m-%d')}
+            else:
+                start_val = {'dateTime': start_dt.strftime('%Y-%m-%dT%H:%M:%S')}
+                end_val   = {'dateTime': (end_dt or start_dt).strftime('%Y-%m-%dT%H:%M:%S')}
+            events.append({'summary': summary, 'start': start_val, 'end': end_val})
+        events.sort(key=lambda e: e['start'].get('dateTime', e['start'].get('date', '')))
+        return events
+    except Exception as ex:
+        print(f"iCal fetch error: {ex}")
+        return []
+
+def clean_student_name(title: str) -> str:
+    name = title.strip()
+    for p in [
+        r'^private\s+lesson\s*[:–\-]\s*',
+        r'^lesson\s+with\s+',
+        r'^lesson\s*[:–\-]\s*',
+        r'^(?:piano|guitar|violin|drums|voice|music)\s+lesson\s*[:–\-]\s*',
+    ]:
+        name = re.sub(p, '', name, flags=re.IGNORECASE).strip()
+    for s in [
+        r"\s*'s\s+(?:\w+\s+)*(?:private\s+)?lesson$",
+        r'\s*[-–]\s*private\s+lesson$',
+        r'\s*[-–]\s*lesson$',
+        r'\s*\(\d+\s*min\w*\)$',
+    ]:
+        name = re.sub(s, '', name, flags=re.IGNORECASE).strip()
+    return name
+
+def get_teacher_today_calendar_events(teacher_id: str) -> list:
+    settings = get_teacher_calendar_settings(teacher_id)
+    if not settings.get("ical_url"):
+        return []
+    all_events = _fetch_ical_events(settings["ical_url"], days=1)
+    today = datetime.now().strftime('%Y-%m-%d')
+    return [e for e in all_events
+            if e['start'].get('dateTime', '').startswith(today) or e['start'].get('date', '') == today]
 
 
 # ── Revenue helpers ────────────────────────────────────────────────────────────
@@ -2077,19 +2191,101 @@ new Chart(document.getElementById('chart'),{{type:'bar',data:{{labels:D.labels,d
 
 # ── Teacher: Schedule placeholder ─────────────────────────────────────────────
 @app.get("/teacher/schedule", response_class=HTMLResponse)
-def teacher_schedule(request: Request):
+def teacher_schedule(request: Request, toast: str = ""):
     teacher = _require_teacher(request)
     if not teacher: return RedirectResponse("/teacher/login", status_code=303)
-    content = """
-<h1 style="margin-bottom:20px;">Schedule</h1>
-<div class="card">
-  <div class="empty-state">
-    <div class="empty-state-icon">📅</div>
-    <h3>Calendar Integration Coming Soon</h3>
-    <p>Connect Google Calendar or iCal to see your schedule here.</p>
-  </div>
+    settings = get_teacher_calendar_settings(teacher["teacher_id"])
+    toast_html = f'<div class="alert alert-success">{_esc(toast)}</div>' if toast else ""
+
+    settings_form = f"""
+<div class="card" style="max-width:520px;">
+  <h3 style="margin-bottom:12px;">{'🔗 Update' if settings['ical_url'] else '🔗 Connect'} Your Calendar</h3>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:14px;">
+    Paste your calendar's iCal share link — works with Google Calendar, Apple Calendar, and Outlook.
+  </p>
+  <form method="post" action="/teacher/schedule/settings">
+    <div class="form-group">
+      <label class="form-label">iCal URL</label>
+      <input type="url" name="ical_url" value="{_esc(settings['ical_url'])}"
+        placeholder="webcal://... or https://..." style="width:100%;box-sizing:border-box;">
+      <div style="font-size:11px;color:var(--muted);margin-top:4px;line-height:1.6;">
+        <strong>Google Calendar:</strong> Settings → your calendar → "Secret address in iCal format" &nbsp;|&nbsp;
+        <strong>Apple Calendar:</strong> Right-click calendar → Share → Copy Link &nbsp;|&nbsp;
+        <strong>Outlook:</strong> Settings → Shared calendars → Publish → ICS link
+      </div>
+    </div>
+    <div class="form-group" style="margin-top:10px;">
+      <label class="form-label">Lesson Keywords (comma separated)</label>
+      <textarea name="lesson_keywords" rows="2" style="width:100%;padding:9px 11px;border:1.5px solid var(--border);border-radius:8px;font-size:13px;font-family:inherit;resize:vertical;">{_esc(', '.join(settings['lesson_keywords']))}</textarea>
+      <div style="font-size:11px;color:var(--muted);margin-top:4px;">Events matching these words appear as lessons.</div>
+    </div>
+    <button type="submit" class="btn" style="margin-top:10px;">Save</button>
+  </form>
 </div>"""
+
+    schedule_html = ""
+    if settings["ical_url"]:
+        today_events = get_teacher_today_calendar_events(teacher["teacher_id"])
+        students     = get_students(teacher["teacher_id"])
+        student_names = {s["name"] for s in students}
+
+        rows = ""
+        for e in today_events:
+            summary  = e.get("summary", "Lesson")
+            start_dt = e.get("start", {}).get("dateTime", "")
+            t = "All day"
+            if start_dt:
+                try:
+                    t = datetime.fromisoformat(start_dt).strftime("%-I:%M %p")
+                except Exception:
+                    t = start_dt
+            cleaned = clean_student_name(summary)
+            matched = cleaned in student_names
+            badge = ('<span class="badge badge-success" style="margin-left:8px;">registered</span>' if matched
+                     else '<span class="badge badge-danger" style="margin-left:8px;">unregistered</span>')
+            rows += (f'<div style="padding:10px 0;border-bottom:1px solid var(--border);'
+                     f'display:flex;justify-content:space-between;align-items:center;">'
+                     f'<span>🎵 {_esc(summary)}{badge}</span>'
+                     f'<span style="color:var(--muted);font-size:12px;">{t}</span></div>')
+
+        unmatched = [clean_student_name(e.get("summary", "")) for e in today_events
+                     if clean_student_name(e.get("summary", "")) and clean_student_name(e.get("summary", "")) not in student_names]
+        unmatched_html = ""
+        if unmatched:
+            names_html = ', '.join(f'<strong>{_esc(n)}</strong>' for n in unmatched)
+            unmatched_html = (
+                f'<div style="background:#451a03;border:1px solid #92400e;border-radius:10px;padding:12px 16px;'
+                f'margin-bottom:12px;font-size:13px;color:#fde68a;">'
+                f'⚠️ {len(unmatched)} calendar event(s) didn\'t match a registered student: {names_html}. '
+                f'Check spelling or <a href="/teacher/students/add" style="color:#fbbf24;text-decoration:underline;">add the student</a>.</div>'
+            )
+
+        schedule_html = f"""
+<div class="card" style="margin-bottom:20px;">
+  <h3 style="margin-bottom:12px;">📅 Today's Lessons</h3>
+  {unmatched_html}
+  {rows or '<p style="color:var(--muted);font-size:13px;">No lessons scheduled today.</p>'}
+</div>"""
+
+    content = f"""
+<h1 style="margin-bottom:20px;">Schedule</h1>
+{toast_html}
+{schedule_html}
+{settings_form}"""
     return HTMLResponse(teacher_page("Schedule", content, "schedule"))
+
+
+@app.post("/teacher/schedule/settings")
+async def teacher_schedule_settings_post(request: Request,
+    ical_url: str = Form(""), lesson_keywords: str = Form("")):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    keywords = [k.strip() for k in lesson_keywords.split(",") if k.strip()]
+    save_teacher_calendar_settings(teacher["teacher_id"], {
+        "ical_url": ical_url.strip().replace("webcal://", "https://"),
+        "lesson_keywords": keywords,
+    })
+    return RedirectResponse("/teacher/schedule?toast=Calendar+settings+saved", status_code=303)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2724,6 +2920,19 @@ async def waitlist_signup(request: Request):
             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
     return JSONResponse({"ok": True})
+
+
+@app.get("/api/admin/waitlist")
+def admin_waitlist(request: Request):
+    """Platform-wide waitlist signups — not scoped to any tenant school, so
+    gated the same way as the backup endpoints (X-Cron-Secret), not tenant
+    auth. Nobody could previously see who signed up except by reading the
+    CSV directly on the server."""
+    if not _require_platform_admin(request):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    rows = _read_csv(WAITLIST_FILE, WAITLIST_HEADERS)
+    rows.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+    return JSONResponse({"ok": True, "count": len(rows), "signups": rows})
 
 
 # ── Stripe: create checkout session ───────────────────────────────────────────
