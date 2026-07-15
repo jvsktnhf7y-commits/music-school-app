@@ -675,6 +675,7 @@ def teacher_page(title, content, active):
         ("notes",      "/teacher/notes",              "📝", "Notes"),
         ("attendance", "/teacher/attendance-history", "📋", "Attendance"),
         ("payments",   "/teacher/payments",           "💳", "Payments"),
+        ("invoices",   "/teacher/invoices",           "🧾", "Invoices"),
         ("analytics",  "/teacher/analytics",          "📊", "Analytics"),
         ("schedule",   "/teacher/schedule",           "📅", "Schedule"),
         ("makeup",     "/teacher/makeup",              "🔄", "Make-ups"),
@@ -2938,6 +2939,12 @@ WAITLIST_HEADERS   = ["id", "email", "created_at"]
 POLICIES_HEADERS   = ["id", "school_id", "title", "body", "created_at", "pdf_filename"]
 SIGNATURES_HEADERS = ["id", "policy_id", "school_id", "student_id",
                       "student_name", "signed_at"]
+INVOICES_FILE      = "/data/invoices.csv"
+INVOICES_HEADERS   = ["id", "school_id", "teacher_id", "student_id", "student_name",
+                      "month", "year", "scheduled_lessons", "total_amount",
+                      "amount_paid", "balance_due", "status", "created_date", "paid_date"]
+MONTH_NAMES = ['', 'January', 'February', 'March', 'April', 'May', 'June',
+               'July', 'August', 'September', 'October', 'November', 'December']
 
 PLAN_PRICES = {
     "school": os.environ.get("STRIPE_PRICE_SCHOOL", ""),   # $99/mo
@@ -2946,6 +2953,7 @@ PLAN_PRICES = {
 _init_csv(WAITLIST_FILE,   WAITLIST_HEADERS)
 _init_csv(POLICIES_FILE,   POLICIES_HEADERS)
 _init_csv(SIGNATURES_FILE, SIGNATURES_HEADERS)
+_init_csv(INVOICES_FILE,   INVOICES_HEADERS)
 
 def _migrate_policies():
     if not os.path.exists(POLICIES_FILE):
@@ -2960,6 +2968,67 @@ def _migrate_policies():
         _write_csv(POLICIES_FILE, POLICIES_HEADERS, rows)
 
 _migrate_policies()
+
+
+# ── Invoices ─────────────────────────────────────────────────────────────────
+# Generated from actual recorded ledger charges for the month, not from
+# calendar-event counting like Studio App's version — every teacher has
+# ledger data, but not every teacher configures calendar sync (iCal is
+# optional here), so this works regardless of that setup.
+def get_all_invoices() -> list[dict]:
+    return _read_csv(INVOICES_FILE, INVOICES_HEADERS)
+
+def save_all_invoices(invoices: list[dict]):
+    _write_csv(INVOICES_FILE, INVOICES_HEADERS, invoices)
+
+def _display_invoice_status(inv: dict) -> str:
+    st = inv.get("status", "draft")
+    if st in ("draft", "sent"):
+        try:
+            now = datetime.now()
+            if (int(inv["year"]), int(inv["month"])) < (now.year, now.month):
+                return "overdue"
+        except Exception:
+            pass
+    return st
+
+def generate_invoices_for_teacher_month(teacher_id: str, school_id: str, year: int, month: int) -> int:
+    """Sums this teacher's ledger charges (negative amounts) per student for
+    the given month and creates one draft invoice per student with charges,
+    skipping students who already have an invoice for that month."""
+    invoices = get_all_invoices()
+    existing = {(i["student_id"], i["year"], i["month"]) for i in invoices
+                if i["teacher_id"] == teacher_id}
+    prefix = f"{year}-{month:02d}"
+    ledger = [r for r in _read_csv(LEDGER_FILE, LEDGER_HEADERS)
+              if r["teacher_id"] == teacher_id and r.get("date", "").startswith(prefix)
+              and float(r.get("amount", 0)) < 0]
+    by_student: dict[str, dict] = {}
+    for r in ledger:
+        sid = r["student_id"]
+        by_student.setdefault(sid, {"name": r.get("student_name", ""), "count": 0, "total": 0.0})
+        by_student[sid]["count"] += 1
+        by_student[sid]["total"] += abs(float(r.get("amount", 0)))
+
+    next_id = max((int(i.get("id") or 0) for i in invoices), default=0) + 1
+    added = 0
+    for student_id, data in by_student.items():
+        if (student_id, str(year), str(month)) in existing:
+            continue
+        total = round(data["total"], 2)
+        invoices.append({
+            "id": str(next_id), "school_id": school_id, "teacher_id": teacher_id,
+            "student_id": student_id, "student_name": data["name"],
+            "month": str(month), "year": str(year),
+            "scheduled_lessons": str(data["count"]),
+            "total_amount": f"{total:.2f}", "amount_paid": "0.00",
+            "balance_due": f"{total:.2f}", "status": "draft",
+            "created_date": datetime.now().strftime("%Y-%m-%d"), "paid_date": "",
+        })
+        next_id += 1
+        added += 1
+    save_all_invoices(invoices)
+    return added
 
 
 # ── Push helper: fire in background thread ─────────────────────────────────────
@@ -2977,6 +3046,164 @@ def _push_parent_note(student_id: str, student_name: str, teacher_name: str):
 
 
 # ── Broadcast ───────────────────────────────────────────────────────────────────
+@app.get("/teacher/invoices", response_class=HTMLResponse)
+def teacher_invoices_page(request: Request, toast: str = ""):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    all_inv = sorted(
+        [i for i in get_all_invoices() if i["teacher_id"] == teacher["teacher_id"]],
+        key=lambda x: (x.get("year", ""), x.get("month", "").zfill(2), x.get("student_name", "")),
+        reverse=True,
+    )
+    toast_html = f'<div class="alert alert-success">{_esc(toast)}</div>' if toast else ""
+    ST_STYLE = {
+        "paid": ("badge-success", "Paid"), "sent": ("badge-info", "Sent"),
+        "draft": ("badge-muted", "Draft"), "overdue": ("badge-danger", "Overdue"),
+    }
+    paid_inv    = [i for i in all_inv if i.get("status") == "paid"]
+    open_inv    = [i for i in all_inv if i.get("status") != "paid"]
+    outstanding = sum(float(i.get("balance_due", 0)) for i in open_inv)
+    overdue_ct  = sum(1 for i in all_inv if _display_invoice_status(i) == "overdue")
+
+    rows = ""
+    for inv in all_inv:
+        iid = inv.get("id", "")
+        m   = int(inv.get("month", 1) or 1)
+        label = f"{MONTH_NAMES[m][:3]} {inv.get('year', '')}"
+        dst = _display_invoice_status(inv)
+        bcls, blbl = ST_STYLE.get(dst, ("badge-muted", dst.title()))
+        bal = float(inv.get("balance_due", 0))
+        rows += (f'<tr><td><a href="/teacher/invoices/{iid}" style="color:var(--primary);font-weight:600;">#INV-{iid.zfill(4)}</a></td>'
+                 f'<td><strong>{_esc(inv.get("student_name",""))}</strong></td><td>{label}</td>'
+                 f'<td style="text-align:center;">{inv.get("scheduled_lessons","—")}</td>'
+                 f'<td>${float(inv.get("total_amount",0)):.2f}</td>'
+                 f'<td style="color:var(--success);font-weight:600;">${float(inv.get("amount_paid",0)):.2f}</td>'
+                 f'<td style="font-weight:700;color:{"var(--danger)" if bal>0 else "var(--success)"};">${bal:.2f}</td>'
+                 f'<td><span class="badge {bcls}">{blbl}</span></td>'
+                 f'<td><a href="/teacher/invoices/{iid}" class="btn btn-outline btn-sm">View</a></td></tr>')
+    if not rows:
+        rows = '<tr><td colspan="9" style="text-align:center;padding:24px;color:var(--muted);">No invoices yet — generate below.</td></tr>'
+
+    now = datetime.now()
+    cur_m, cur_y = now.month, now.year
+    opts = "".join(f'<option value="{i}"{" selected" if i==cur_m else ""}>{MONTH_NAMES[i]}</option>' for i in range(1, 13))
+
+    content = f"""
+{toast_html}
+<div class="stats-row">
+  <div class="stat-card"><div class="stat-icon" style="background:#e0e7ff;">🧾</div><div class="stat-val">{len(all_inv)}</div><div class="stat-lbl">Total</div></div>
+  <div class="stat-card"><div class="stat-icon" style="background:#d1fae5;">✅</div><div class="stat-val">{len(paid_inv)}</div><div class="stat-lbl">Paid</div></div>
+  <div class="stat-card"><div class="stat-icon" style="background:#fee2e2;">🔴</div><div class="stat-val">{overdue_ct}</div><div class="stat-lbl">Overdue</div></div>
+  <div class="stat-card"><div class="stat-icon" style="background:#fef3c7;">💰</div><div class="stat-val">${outstanding:.2f}</div><div class="stat-lbl">Outstanding</div></div>
+</div>
+<div class="card">
+  <h2 style="margin:0 0 12px;">🧾 Invoices</h2>
+  <table><thead><tr><th>Invoice</th><th>Student</th><th>Period</th><th style="text-align:center;">Lessons</th><th>Total</th><th>Paid</th><th>Balance</th><th>Status</th><th></th></tr></thead>
+  <tbody>{rows}</tbody></table>
+</div>
+<div class="card" style="max-width:440px;">
+  <h2>⚡ Generate Invoices</h2>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;">
+    Sums recorded lesson charges per student for the selected month and creates draft invoices.
+  </p>
+  <form action="/teacher/invoices/generate" method="post">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+      <div class="form-group" style="margin:0;"><label class="form-label">Month</label><select name="month">{opts}</select></div>
+      <div class="form-group" style="margin:0;"><label class="form-label">Year</label><input type="number" name="year" value="{cur_y}" min="2020" max="2035" required></div>
+    </div>
+    <button type="submit" class="btn" style="margin-top:14px;">⚡ Generate</button>
+  </form>
+</div>"""
+    return HTMLResponse(teacher_page("Invoices", content, "invoices"))
+
+
+@app.post("/teacher/invoices/generate")
+def teacher_generate_invoices(request: Request, month: int = Form(...), year: int = Form(...)):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    count = generate_invoices_for_teacher_month(teacher["teacher_id"], teacher["school_id"], year, month)
+    period = f"{MONTH_NAMES[month]} {year}"
+    toast = f"Generated {count} invoice(s) for {period}" if count else f"No new invoices for {period}"
+    return RedirectResponse(f"/teacher/invoices?toast={toast}", status_code=303)
+
+
+@app.get("/teacher/invoices/{invoice_id}", response_class=HTMLResponse)
+def teacher_invoice_detail(invoice_id: str, request: Request, toast: str = ""):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    inv = next((i for i in get_all_invoices()
+                if i["id"] == invoice_id and i["teacher_id"] == teacher["teacher_id"]), None)
+    if not inv: return RedirectResponse("/teacher/invoices", status_code=303)
+    toast_html = f'<div class="alert alert-success">{_esc(toast)}</div>' if toast else ""
+    m = int(inv.get("month", 1) or 1)
+    status = inv.get("status", "draft")
+    total  = float(inv.get("total_amount", 0))
+    paid   = float(inv.get("amount_paid", 0))
+    bal    = float(inv.get("balance_due", 0))
+    actions = ""
+    if status == "draft":
+        actions += f'<form action="/teacher/invoices/{invoice_id}/mark-sent" method="post" style="display:inline;"><button class="btn btn-outline btn-sm" type="submit">📤 Mark Sent</button></form> '
+    if status != "paid":
+        actions += f'<form action="/teacher/invoices/{invoice_id}/mark-paid" method="post" style="display:inline;"><button class="btn btn-success btn-sm" type="submit">✅ Mark Paid</button></form>'
+    content = f"""
+{toast_html}
+<div class="card" style="max-width:560px;">
+  <h2 style="margin-bottom:4px;">Invoice #INV-{invoice_id.zfill(4)}</h2>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:20px;">{_esc(inv.get('student_name',''))} — {MONTH_NAMES[m]} {inv.get('year','')}</p>
+  <table style="margin-bottom:18px;">
+    <tbody>
+      <tr><td>{inv.get('scheduled_lessons','')} lesson(s) charged</td><td style="text-align:right;font-weight:600;">${total:.2f}</td></tr>
+      <tr><td style="color:var(--success);">Amount Paid</td><td style="text-align:right;color:var(--success);font-weight:600;">-${paid:.2f}</td></tr>
+      <tr style="border-top:2px solid var(--border);"><td style="font-weight:700;">Balance Due</td>
+        <td style="text-align:right;font-weight:800;font-size:18px;color:{'var(--success)' if bal<=0 else 'var(--danger)'};">${bal:.2f}</td></tr>
+    </tbody>
+  </table>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;">
+    {actions}
+    <a href="/teacher/invoices" class="btn btn-outline">← All Invoices</a>
+  </div>
+</div>"""
+    return HTMLResponse(teacher_page(f"Invoice #INV-{invoice_id.zfill(4)}", content, "invoices"))
+
+
+@app.post("/teacher/invoices/{invoice_id}/mark-sent")
+def teacher_mark_invoice_sent(invoice_id: str, request: Request):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    invoices = get_all_invoices()
+    for inv in invoices:
+        if inv["id"] == invoice_id and inv["teacher_id"] == teacher["teacher_id"] and inv.get("status") == "draft":
+            inv["status"] = "sent"
+    save_all_invoices(invoices)
+    return RedirectResponse(f"/teacher/invoices/{invoice_id}?toast=Invoice+marked+as+sent", status_code=303)
+
+
+@app.post("/teacher/invoices/{invoice_id}/mark-paid")
+def teacher_mark_invoice_paid(invoice_id: str, request: Request):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    invoices = get_all_invoices()
+    target = None
+    for inv in invoices:
+        if inv["id"] == invoice_id and inv["teacher_id"] == teacher["teacher_id"]:
+            target = inv
+            inv["status"]      = "paid"
+            inv["paid_date"]   = datetime.now().strftime("%Y-%m-%d")
+            inv["amount_paid"] = inv.get("total_amount", "0.00")
+            inv["balance_due"] = "0.00"
+    save_all_invoices(invoices)
+    if target:
+        _append_csv(LEDGER_FILE, LEDGER_HEADERS, {
+            "id": secrets.token_hex(6), "school_id": target["school_id"],
+            "teacher_id": target["teacher_id"], "student_id": target["student_id"],
+            "student_name": target.get("student_name", ""),
+            "date": datetime.now().strftime("%Y-%m-%d"), "status": "Payment",
+            "amount": target.get("total_amount", "0.00"),
+            "notes": f"Invoice #{invoice_id} — {MONTH_NAMES[int(target.get('month',1) or 1)]} {target.get('year','')}",
+        })
+    return RedirectResponse(f"/teacher/invoices/{invoice_id}?toast=Invoice+marked+as+paid", status_code=303)
+
+
 @app.get("/teacher/makeup", response_class=HTMLResponse)
 def teacher_makeup_page(request: Request, toast: str = ""):
     teacher = _require_teacher(request)
