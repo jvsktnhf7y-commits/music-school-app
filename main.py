@@ -557,6 +557,38 @@ def get_teacher_today_calendar_events(teacher_id: str) -> list:
             if e['start'].get('dateTime', '').startswith(today) or e['start'].get('date', '') == today]
 
 
+# ── Make-up lessons: credits + bookable slots ──────────────────────────────────
+# Keyed by student_id/teacher_id (not name) to avoid the ambiguity risk of
+# name-keyed storage across a multi-teacher, multi-school platform.
+MAKEUP_CREDITS_FILE = "/data/makeup_credits.json"
+MAKEUP_SLOTS_FILE   = "/data/makeup_slots.json"
+
+def _load_makeup_credits() -> dict:
+    if not os.path.exists(MAKEUP_CREDITS_FILE):
+        return {}
+    with open(MAKEUP_CREDITS_FILE) as f:
+        return json.load(f)
+
+def _save_makeup_credits(c: dict):
+    with open(MAKEUP_CREDITS_FILE, "w") as f:
+        json.dump(c, f, indent=2)
+
+def _issue_makeup_credit(student_id: str):
+    credits = _load_makeup_credits()
+    credits[student_id] = credits.get(student_id, 0) + 1
+    _save_makeup_credits(credits)
+
+def _load_makeup_slots() -> list:
+    if not os.path.exists(MAKEUP_SLOTS_FILE):
+        return []
+    with open(MAKEUP_SLOTS_FILE) as f:
+        return json.load(f)
+
+def _save_makeup_slots(slots: list):
+    with open(MAKEUP_SLOTS_FILE, "w") as f:
+        json.dump(slots, f, indent=2)
+
+
 # ── Revenue helpers ────────────────────────────────────────────────────────────
 def school_revenue(school_id: str) -> float:
     return sum(float(r.get("amount", 0)) for r in _read_csv(LEDGER_FILE, LEDGER_HEADERS)
@@ -645,6 +677,7 @@ def teacher_page(title, content, active):
         ("payments",   "/teacher/payments",           "💳", "Payments"),
         ("analytics",  "/teacher/analytics",          "📊", "Analytics"),
         ("schedule",   "/teacher/schedule",           "📅", "Schedule"),
+        ("makeup",     "/teacher/makeup",              "🔄", "Make-ups"),
         ("broadcast",  "/teacher/broadcast",           "📣", "Broadcast"),
     ], "/teacher/logout")
 
@@ -1843,6 +1876,8 @@ async def teacher_record_attendance(student_id: str, request: Request,
             if r["student_id"] == student_id:
                 r["prepaid"] = f"{float(r.get('prepaid',0)) - rate:.2f}"
         _write_csv(STUDENTS_FILE, STUDENTS_HEADERS, rows)
+    elif status == "Cancelled":
+        _issue_makeup_credit(student_id)
     _append_csv(LEDGER_FILE, LEDGER_HEADERS, {
         "id": secrets.token_hex(6), "school_id": teacher["school_id"],
         "teacher_id": teacher["teacher_id"], "student_id": student_id,
@@ -2843,6 +2878,50 @@ async def mobile_parent_register_push(request: Request):
     return JSONResponse({"ok": True})
 
 
+@app.get("/api/mobile/parent/makeup/credits")
+def mobile_parent_makeup_credits(request: Request):
+    student = _parent_auth(request)
+    if not student: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    credits = _load_makeup_credits()
+    return JSONResponse({"ok": True, "credits": credits.get(student["student_id"], 0)})
+
+
+@app.get("/api/mobile/parent/makeup/slots")
+def mobile_parent_makeup_slots(request: Request):
+    student = _parent_auth(request)
+    if not student: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    # Only slots from this student's own teacher — a slot offered by a
+    # different teacher (even in the same school) isn't relevant or bookable.
+    slots = [s for s in _load_makeup_slots()
+             if s["teacher_id"] == student["teacher_id"] and not s.get("booked_by")]
+    return JSONResponse({"ok": True, "slots": slots})
+
+
+@app.post("/api/mobile/parent/makeup/book")
+async def mobile_parent_book_makeup(request: Request):
+    student = _parent_auth(request)
+    if not student: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    data    = await request.json()
+    slot_id = data.get("slot_id", "").strip()
+    slots   = _load_makeup_slots()
+    slot    = next((s for s in slots if s["id"] == slot_id and not s.get("booked_by")), None)
+    if not slot or slot["teacher_id"] != student["teacher_id"]:
+        return JSONResponse({"ok": False, "error": "Slot not available"}, status_code=404)
+    credits = _load_makeup_credits()
+    if credits.get(student["student_id"], 0) <= 0:
+        return JSONResponse({"ok": False, "error": "No make-up credits"}, status_code=403)
+    slot["booked_by"] = student["student_id"]
+    _save_makeup_slots(slots)
+    credits[student["student_id"]] = max(0, credits[student["student_id"]] - 1)
+    _save_makeup_credits(credits)
+    token = _load_push_tokens().get(f"teacher:{student['teacher_id']}")
+    if token:
+        _send_push(token, "Make-up lesson booked",
+                  f"{student['name']} booked the {slot['date']} at {slot['time']} slot.",
+                  {"screen": "Makeup"})
+    return JSONResponse({"ok": True, "slot": slot, "credits_remaining": credits[student["student_id"]]})
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SESSION 2: Stripe billing · Push on note · Policy signing · Waitlist
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2898,6 +2977,118 @@ def _push_parent_note(student_id: str, student_name: str, teacher_name: str):
 
 
 # ── Broadcast ───────────────────────────────────────────────────────────────────
+@app.get("/teacher/makeup", response_class=HTMLResponse)
+def teacher_makeup_page(request: Request, toast: str = ""):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    students = get_students(teacher["teacher_id"])
+    credits  = _load_makeup_credits()
+    slots    = [s for s in _load_makeup_slots() if s["teacher_id"] == teacher["teacher_id"]]
+    toast_html = f'<div class="alert alert-success">{_esc(toast)}</div>' if toast else ""
+
+    credit_rows = "".join(
+        f'<tr><td>{_esc(s["name"])}</td>'
+        f'<td><span class="badge badge-info">{credits.get(s["student_id"], 0)} credit(s)</span></td>'
+        f'<td>'
+        f'<form method="post" action="/teacher/makeup/adjust" style="display:inline;">'
+        f'<input type="hidden" name="student_id" value="{s["student_id"]}">'
+        f'<input type="hidden" name="delta" value="1">'
+        f'<button class="btn btn-sm btn-outline" type="submit">+1</button></form> '
+        f'<form method="post" action="/teacher/makeup/adjust" style="display:inline;">'
+        f'<input type="hidden" name="student_id" value="{s["student_id"]}">'
+        f'<input type="hidden" name="delta" value="-1">'
+        f'<button class="btn btn-sm btn-outline" type="submit">-1</button></form>'
+        f'</td></tr>'
+        for s in students
+    ) or '<tr><td colspan="3" style="text-align:center;color:var(--muted);">No students yet.</td></tr>'
+
+    slot_rows = "".join(
+        f'<tr><td>{s["date"]} at {s["time"]}</td><td>{s["duration"]} min</td>'
+        f'<td>{"<span class=\'badge badge-success\'>Booked: " + _esc(next((st["name"] for st in students if st["student_id"]==s["booked_by"]), "?")) + "</span>" if s.get("booked_by") else "<span class=\'badge badge-info\'>Open</span>"}</td>'
+        f'<td>{"" if s.get("booked_by") else f"""<form method='post' action='/teacher/makeup/slots/{s["id"]}/delete' style='display:inline;'><button class='btn btn-sm btn-outline' type='submit'>Remove</button></form>"""}</td></tr>'
+        for s in slots
+    ) or '<tr><td colspan="4" style="text-align:center;color:var(--muted);">No make-up slots yet.</td></tr>'
+
+    content = f"""
+{toast_html}
+<h1 style="margin-bottom:20px;">🔄 Make-up Lessons</h1>
+<div class="card" style="margin-bottom:20px;">
+  <h3 style="margin-bottom:12px;">Student Credits</h3>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:14px;">
+    A credit is issued automatically when you mark a lesson "Cancelled." Parents use a credit to book an open slot below.
+  </p>
+  <table><thead><tr><th>Student</th><th>Credits</th><th>Adjust</th></tr></thead>
+  <tbody>{credit_rows}</tbody></table>
+</div>
+<div class="card" style="margin-bottom:20px;">
+  <h3 style="margin-bottom:12px;">Make-up Slots</h3>
+  <table><thead><tr><th>When</th><th>Duration</th><th>Status</th><th></th></tr></thead>
+  <tbody>{slot_rows}</tbody></table>
+</div>
+<div class="card" style="max-width:480px;">
+  <h3 style="margin-bottom:12px;">Add a Slot</h3>
+  <form method="post" action="/teacher/makeup/slots/add">
+    <div class="form-group"><label class="form-label">Date</label>
+      <input type="date" name="date" required></div>
+    <div class="form-group"><label class="form-label">Time</label>
+      <input type="time" name="time" required></div>
+    <div class="form-group"><label class="form-label">Duration (minutes)</label>
+      <input type="number" name="duration" value="30" min="15" step="15" required></div>
+    <button class="btn" type="submit" style="margin-top:8px;">Add Slot</button>
+  </form>
+</div>"""
+    return HTMLResponse(teacher_page("Make-up Lessons", content, "makeup"))
+
+
+@app.post("/teacher/makeup/adjust")
+def teacher_makeup_adjust(request: Request, student_id: str = Form(...), delta: int = Form(...)):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    student = get_student(student_id)
+    if not student or student["teacher_id"] != teacher["teacher_id"]:
+        return RedirectResponse("/teacher/makeup", status_code=303)
+    credits = _load_makeup_credits()
+    credits[student_id] = max(0, credits.get(student_id, 0) + delta)
+    _save_makeup_credits(credits)
+    return RedirectResponse("/teacher/makeup?toast=Credits+updated", status_code=303)
+
+
+@app.post("/teacher/makeup/slots/add")
+def teacher_makeup_add_slot(request: Request,
+    date: str = Form(...), time: str = Form(...), duration: int = Form(30)):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    slots = _load_makeup_slots()
+    slot_id = secrets.token_hex(6)
+    slots.append({
+        "id": slot_id, "school_id": teacher["school_id"], "teacher_id": teacher["teacher_id"],
+        "date": date, "time": time, "duration": duration, "booked_by": None,
+    })
+    _save_makeup_slots(slots)
+    # Notify parents of students with unused credits under this teacher
+    tokens   = _load_push_tokens()
+    credits  = _load_makeup_credits()
+    students = get_students(teacher["teacher_id"])
+    for s in students:
+        if credits.get(s["student_id"], 0) > 0:
+            token = tokens.get(f"parent:{s['student_id']}")
+            if token:
+                _send_push(token, "Make-up slot available",
+                          f"A make-up lesson slot opened on {date} at {time}. Tap to book.",
+                          {"screen": "Makeup"})
+    return RedirectResponse("/teacher/makeup?toast=Slot+added", status_code=303)
+
+
+@app.post("/teacher/makeup/slots/{slot_id}/delete")
+def teacher_makeup_delete_slot(slot_id: str, request: Request):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    slots = [s for s in _load_makeup_slots()
+             if not (s["id"] == slot_id and s["teacher_id"] == teacher["teacher_id"] and not s.get("booked_by"))]
+    _save_makeup_slots(slots)
+    return RedirectResponse("/teacher/makeup?toast=Slot+removed", status_code=303)
+
+
 @app.get("/teacher/broadcast", response_class=HTMLResponse)
 def teacher_broadcast_page(request: Request, sent: str = "", error: str = ""):
     teacher = _require_teacher(request)
