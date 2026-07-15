@@ -631,6 +631,7 @@ def school_page(title, content, active):
         ("students",  "/school/students",  "👥", "All Students"),
         ("analytics", "/school/analytics", "📊", "Analytics"),
         ("policies",  "/school/policies",  "📋", "Policies"),
+        ("broadcast", "/school/broadcast", "📣", "Broadcast"),
         ("settings",  "/school/settings",  "⚙️",  "Settings"),
     ], "/school/logout")
 
@@ -644,6 +645,7 @@ def teacher_page(title, content, active):
         ("payments",   "/teacher/payments",           "💳", "Payments"),
         ("analytics",  "/teacher/analytics",          "📊", "Analytics"),
         ("schedule",   "/teacher/schedule",           "📅", "Schedule"),
+        ("broadcast",  "/teacher/broadcast",           "📣", "Broadcast"),
     ], "/teacher/logout")
 
 
@@ -2893,6 +2895,136 @@ def _push_parent_note(student_id: str, student_name: str, teacher_name: str):
                   {"type": "note", "student_id": student_id}),
             daemon=True,
         ).start()
+
+
+# ── Broadcast ───────────────────────────────────────────────────────────────────
+@app.get("/teacher/broadcast", response_class=HTMLResponse)
+def teacher_broadcast_page(request: Request, sent: str = "", error: str = ""):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    students = get_students(teacher["teacher_id"])
+    tokens = _load_push_tokens()
+    parent_count = len([s for s in students if tokens.get(f"parent:{s['student_id']}")])
+    banner = ""
+    if sent:
+        banner = f'<div class="alert alert-success" style="margin-bottom:20px;">✅ Message sent to {sent} parent(s).</div>'
+    if error:
+        banner = f'<div class="alert alert-danger" style="margin-bottom:20px;">❌ {_esc(error)}</div>'
+    content = f"""
+{banner}
+<div class="card" style="max-width:640px;">
+  <h2 style="margin-top:0;">📣 Broadcast to Parents</h2>
+  <p style="color:var(--muted);font-size:14px;margin-bottom:24px;">
+    Send a push notification to your students' parents ({parent_count} registered).
+  </p>
+  <form method="post" action="/teacher/broadcast">
+    <div class="form-group">
+      <label class="form-label">Title</label>
+      <input type="text" name="title" placeholder="e.g. Lesson cancelled Saturday" required maxlength="100" style="width:100%;box-sizing:border-box;">
+    </div>
+    <div class="form-group" style="margin-top:14px;">
+      <label class="form-label">Message</label>
+      <textarea name="body" rows="4" placeholder="e.g. No lesson this Saturday. See you next week!" required maxlength="300" style="width:100%;padding:8px 11px;border:1.5px solid var(--border);border-radius:8px;font-size:13px;font-family:inherit;resize:vertical;"></textarea>
+    </div>
+    <button type="submit" class="btn" style="margin-top:16px;width:100%;">Send Notification</button>
+  </form>
+</div>"""
+    return HTMLResponse(teacher_page("Broadcast", content, "broadcast"))
+
+
+@app.post("/teacher/broadcast")
+def teacher_broadcast_send(request: Request, title: str = Form(...), body: str = Form(...)):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    if not title.strip() or not body.strip():
+        return RedirectResponse("/teacher/broadcast?error=Title+and+message+are+required.", status_code=303)
+    students = get_students(teacher["teacher_id"])
+    tokens = _load_push_tokens()
+    count = 0
+    for s in students:
+        token = tokens.get(f"parent:{s['student_id']}")
+        if token:
+            _send_push(token, title.strip(), body.strip(), {"screen": "Home"})
+            count += 1
+    return RedirectResponse(f"/teacher/broadcast?sent={count}", status_code=303)
+
+
+@app.get("/school/broadcast", response_class=HTMLResponse)
+def school_broadcast_page(request: Request, sent: str = "", error: str = ""):
+    school = _require_school(request)
+    if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
+    students = get_all_school_students(school["school_id"])
+    teachers = get_teachers(school["school_id"])
+    tokens = _load_push_tokens()
+    parent_count  = len([s for s in students if tokens.get(f"parent:{s['student_id']}")])
+    teacher_count = len([t for t in teachers if tokens.get(f"teacher:{t['teacher_id']}")])
+    banner = ""
+    if sent:
+        banner = f'<div class="alert alert-success" style="margin-bottom:20px;">✅ Message sent to {sent} recipient(s).</div>'
+    if error:
+        banner = f'<div class="alert alert-danger" style="margin-bottom:20px;">❌ {_esc(error)}</div>'
+    content = f"""
+{banner}
+<div class="card" style="max-width:640px;">
+  <h2 style="margin-top:0;">📣 Broadcast Message</h2>
+  <p style="color:var(--muted);font-size:14px;margin-bottom:24px;">
+    Send a push notification to all parents in your school ({parent_count} registered) and/or all teachers ({teacher_count} registered).
+  </p>
+  <form method="post" action="/school/broadcast">
+    <div class="form-group">
+      <label class="form-label">Title</label>
+      <input type="text" name="title" placeholder="e.g. School closed Monday" required maxlength="100" style="width:100%;box-sizing:border-box;">
+    </div>
+    <div class="form-group" style="margin-top:14px;">
+      <label class="form-label">Message</label>
+      <textarea name="body" rows="4" placeholder="e.g. The school will be closed Monday for the holiday." required maxlength="300" style="width:100%;padding:8px 11px;border:1.5px solid var(--border);border-radius:8px;font-size:13px;font-family:inherit;resize:vertical;"></textarea>
+    </div>
+    <div class="form-group" style="margin-top:14px;">
+      <label class="form-label">Send to</label>
+      <div style="display:flex;gap:20px;margin-top:6px;">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+          <input type="checkbox" name="send_parents" value="1" checked> Parents ({parent_count})
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+          <input type="checkbox" name="send_teachers" value="1"> Teachers ({teacher_count})
+        </label>
+      </div>
+    </div>
+    <button type="submit" class="btn" style="margin-top:20px;width:100%;">Send Notification</button>
+  </form>
+</div>"""
+    return HTMLResponse(school_page("Broadcast", content, "broadcast"))
+
+
+@app.post("/school/broadcast")
+def school_broadcast_send(
+    request: Request,
+    title: str = Form(...), body: str = Form(...),
+    send_parents: str = Form(default=""), send_teachers: str = Form(default=""),
+):
+    school = _require_school(request)
+    if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
+    if not title.strip() or not body.strip():
+        return RedirectResponse("/school/broadcast?error=Title+and+message+are+required.", status_code=303)
+    tokens = _load_push_tokens()
+    count = 0
+    if send_parents:
+        for s in get_all_school_students(school["school_id"]):
+            token = tokens.get(f"parent:{s['student_id']}")
+            if token:
+                _send_push(token, title.strip(), body.strip(), {"screen": "Home"})
+                count += 1
+    if send_teachers:
+        for t in get_teachers(school["school_id"]):
+            token = tokens.get(f"teacher:{t['teacher_id']}")
+            if token:
+                _send_push(token, title.strip(), body.strip(), {})
+                count += 1
+    return RedirectResponse(f"/school/broadcast?sent={count}", status_code=303)
 
 
 # ── Patch add-note endpoints to fire push ─────────────────────────────────────
