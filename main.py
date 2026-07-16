@@ -30,6 +30,19 @@ def _send_email(to: str, subject: str, body_html: str) -> bool:
         print(f"[Email error] {e}")
         return False
 
+# ── Error tracking (Sentry) ────────────────────────────────────────────────────
+# Inert unless SENTRY_DSN is set. traces_sample_rate=0 (error capture only, no
+# perf tracing) to stay on Sentry's free tier without a separate cost call.
+_SENTRY_DSN = os.environ.get("SENTRY_DSN", "")
+if _SENTRY_DSN:
+    import sentry_sdk
+    sentry_sdk.init(
+        dsn=_SENTRY_DSN,
+        environment=os.environ.get("SENTRY_ENVIRONMENT", "production"),
+        traces_sample_rate=0.0,
+        send_default_pii=False,
+    )
+
 app = FastAPI(title="Music School App")
 
 app.add_middleware(
