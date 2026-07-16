@@ -737,7 +737,7 @@ def _login_html(title: str, action: str, fields: str, error: str = "",
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ROOT
 # ═══════════════════════════════════════════════════════════════════════════════
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return RedirectResponse("/school/login")
 
