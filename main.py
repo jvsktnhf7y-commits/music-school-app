@@ -2480,6 +2480,13 @@ def serve_css():
 def health():
     return {"ok": True}
 
+# TEMPORARY — Sentry verification only, remove after confirming capture works.
+@app.get("/sentry-verify-temp")
+def _sentry_verify_temp(request: Request):
+    if not _require_school(request):
+        return RedirectResponse("/school/login", status_code=303)
+    1 / 0
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MOBILE API
