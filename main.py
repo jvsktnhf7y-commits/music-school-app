@@ -2463,7 +2463,7 @@ def serve_css():
     return Response(content=CSS, media_type="text/css")
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {"ok": True}
 
