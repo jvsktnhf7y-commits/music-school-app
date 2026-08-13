@@ -1,7 +1,7 @@
 from fastapi import FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-import os, csv, json, secrets, hashlib, time
+import os, csv, json, secrets, hashlib, time, re
 from datetime import datetime, timedelta
 
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
@@ -30,6 +30,19 @@ def _send_email(to: str, subject: str, body_html: str) -> bool:
         print(f"[Email error] {e}")
         return False
 
+# ── Error tracking (Sentry) ────────────────────────────────────────────────────
+# Inert unless SENTRY_DSN is set. traces_sample_rate=0 (error capture only, no
+# perf tracing) to stay on Sentry's free tier without a separate cost call.
+_SENTRY_DSN = os.environ.get("SENTRY_DSN", "")
+if _SENTRY_DSN:
+    import sentry_sdk
+    sentry_sdk.init(
+        dsn=_SENTRY_DSN,
+        environment=os.environ.get("SENTRY_ENVIRONMENT", "production"),
+        traces_sample_rate=0.0,
+        send_default_pii=False,
+    )
+
 app = FastAPI(title="Music School App")
 
 app.add_middleware(
@@ -37,6 +50,66 @@ app.add_middleware(
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
+
+from urllib.parse import urlparse as _urlparse
+
+@app.middleware("http")
+async def csrf_origin_middleware(request: Request, call_next):
+    """Verify Origin/Referer host on state-changing browser requests.
+    Exempt: /api/* (bearer-auth mobile, webhooks, cron — CSRF-immune) and
+    /waitlist (the landing page posts to it cross-origin by design)."""
+    path = request.url.path
+    if (request.method in ("POST", "PUT", "PATCH", "DELETE")
+            and not path.startswith("/api/") and path != "/waitlist"):
+        origin = request.headers.get("origin") or request.headers.get("referer", "")
+        if origin:
+            # "null" is sent by sandboxed iframes/data: URIs and produces an
+            # empty netloc — must fail closed (block), not silently pass.
+            o_host = _urlparse(origin).netloc
+            if not o_host or o_host != request.headers.get("host", ""):
+                return Response("Cross-origin request blocked", status_code=403)
+    return await call_next(request)
+
+
+_MOBILE_SUB_GATE_EXEMPT = {
+    "/api/mobile/school/login", "/api/mobile/teacher/login",
+    "/api/mobile/school/billing/checkout", "/api/mobile/school/billing/portal",
+    "/api/mobile/school/billing/confirm",
+    "/api/mobile/school/subscription-status", "/api/mobile/teacher/subscription-status",
+}
+
+@app.middleware("http")
+async def mobile_subscription_gate(request: Request, call_next):
+    """Mobile school/teacher API calls are gated by the school's subscription.
+    Web routes redirect to /school/subscribe via _school_access_response, but
+    mobile has no equivalent per-route check — without this, a school whose
+    trial expired or subscription lapsed could keep using the mobile app
+    indefinitely. Login and billing endpoints stay exempt (a school must be
+    able to check status and subscribe even while unsubscribed)."""
+    path = request.url.path
+    if (path in _MOBILE_SUB_GATE_EXEMPT
+            or not (path.startswith("/api/mobile/school/") or path.startswith("/api/mobile/teacher/"))):
+        return await call_next(request)
+
+    school = None
+    if path.startswith("/api/mobile/school/"):
+        payload = _bearer_payload(request, "school")
+        if payload:
+            school = get_school(payload["s"])
+    else:
+        payload = _bearer_payload(request, "teacher")
+        if payload:
+            teacher = get_teacher(payload["s"])
+            if teacher:
+                school = get_school(teacher.get("school_id", ""))
+
+    if school:
+        has_access, _ = school_has_access(school)
+        if not has_access:
+            return JSONResponse({"ok": False, "error": "subscription_required"}, status_code=402)
+
+    return await call_next(request)  # no valid token found: let the route's own auth 401 it
+
 
 os.makedirs("static", exist_ok=True)
 os.makedirs("/data", exist_ok=True)
@@ -46,6 +119,20 @@ _login_attempts: dict = {}
 _MAX_ATTEMPTS = 5
 _LOCKOUT_SECS = 600
 
+def _client_ip(request: Request) -> str:
+    """request.client.host alone is Render's internal proxy IP for every
+    request, collapsing all users into one shared rate-limit bucket. Read
+    the LAST entry in X-Forwarded-For, not the first: that header is an
+    append-only chain, and the first entry can be attacker-supplied if a
+    proxy appends rather than replaces. The last entry is whatever Render's
+    own edge (the only hop in front of a standard Render web service)
+    appended, which is safe regardless of whether Render appends or
+    replaces the incoming header."""
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[-1].strip()
+    return request.client.host if request.client else "unknown"
+
 def _rl_blocked(ip: str) -> bool:
     e = _login_attempts.get(ip)
     return bool(e and e["locked_until"] > time.time())
@@ -53,7 +140,9 @@ def _rl_blocked(ip: str) -> bool:
 def _rl_fail(ip: str):
     now = time.time()
     e   = _login_attempts.get(ip, {"count": 0, "locked_until": 0})
-    if e["locked_until"] < now: e["count"] += 1
+    if e["locked_until"] and e["locked_until"] < now:
+        e = {"count": 0, "locked_until": 0}  # lockout window passed; start fresh
+    e["count"] += 1
     if e["count"] >= _MAX_ATTEMPTS: e["locked_until"] = now + _LOCKOUT_SECS
     _login_attempts[ip] = e
 
@@ -135,7 +224,8 @@ LEDGER_FILE   = "/data/ledger.csv"
 NOTES_FILE    = "/data/notes.csv"
 
 SCHOOLS_HEADERS  = ["school_id", "name", "owner_email", "owner_name", "password_hash",
-                    "plan", "created_at", "active"]
+                    "plan", "created_at", "active", "trial_ends", "is_subscribed",
+                    "stripe_customer_id", "subscription_status"]
 TEACHERS_HEADERS = ["teacher_id", "school_id", "name", "email", "password_hash",
                     "created_at", "active"]
 STUDENTS_HEADERS = ["student_id", "school_id", "teacher_id", "name", "rate",
@@ -158,7 +248,6 @@ _init_csv(STUDENTS_FILE, STUDENTS_HEADERS)
 _init_csv(LEDGER_FILE,   LEDGER_HEADERS)
 _init_csv(NOTES_FILE,    NOTES_HEADERS)
 
-
 def _read_csv(path, headers) -> list[dict]:
     if not os.path.exists(path):
         return []
@@ -180,9 +269,47 @@ def _append_csv(path, headers, row: dict):
             {k: row.get(k, "") for k in headers}
         )
 
+def _migrate_schools():
+    if not os.path.exists(SCHOOLS_FILE):
+        return
+    with open(SCHOOLS_FILE, "r") as f:
+        r      = csv.DictReader(f)
+        fields = list(r.fieldnames or [])
+        rows   = [dict(row) for row in r]
+    if not set(SCHOOLS_HEADERS).issubset(set(fields)):
+        for row in rows:
+            row.setdefault("trial_ends",          "")
+            row.setdefault("is_subscribed",       "true")
+            row.setdefault("stripe_customer_id",  "")
+            row.setdefault("subscription_status", "")
+        _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, rows)
+
+_migrate_schools()
+
 
 def _hash(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()
+
+
+# ── Password hashing (bcrypt, with legacy sha256 fallback) ────────────────────
+import bcrypt as _bcrypt
+from html import escape as _esc
+
+def _hash_password(password: str) -> str:
+    return _bcrypt.hashpw(password.encode(), _bcrypt.gensalt()).decode()
+
+def _check_password(password: str, stored: str) -> bool:
+    if not stored:
+        return False
+    if stored.startswith("$2"):
+        try:
+            return _bcrypt.checkpw(password.encode(), stored.encode())
+        except ValueError:
+            return False
+    return _hash(password) == stored  # legacy sha256
+
+def _needs_rehash(stored: str) -> bool:
+    return bool(stored) and not stored.startswith("$2")
 
 
 # ── School helpers ─────────────────────────────────────────────────────────────
@@ -193,6 +320,105 @@ def get_school(school_id: str) -> dict | None:
 def get_school_by_email(email: str) -> dict | None:
     return next((s for s in _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
                  if s["owner_email"] == email), None)
+
+def _update_school(school_id: str, **kwargs):
+    rows = _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
+    for r in rows:
+        if r["school_id"] == school_id:
+            r.update(kwargs)
+    _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, rows)
+
+def school_has_access(school: dict) -> tuple[bool, str]:
+    if school.get("is_subscribed") == "true":
+        return True, "subscribed"
+    trial_ends = school.get("trial_ends", "")
+    if trial_ends:
+        try:
+            if datetime.strptime(trial_ends, "%Y-%m-%d").date() >= datetime.now().date():
+                return True, "trial"
+        except ValueError:
+            pass
+    return False, "expired"
+
+def school_trial_days(school: dict) -> int:
+    trial_ends = school.get("trial_ends", "")
+    if not trial_ends:
+        return 0
+    try:
+        return max(0, (datetime.strptime(trial_ends, "%Y-%m-%d").date() - datetime.now().date()).days)
+    except ValueError:
+        return 0
+
+
+# ── Signed session tokens ──────────────────────────────────────────────────────
+from itsdangerous import URLSafeTimedSerializer
+
+SECRET_KEY_FILE      = "/data/secret_key"
+TOKEN_MAX_AGE_WEB    = 30 * 86400
+TOKEN_MAX_AGE_MOBILE = 90 * 86400
+
+def _load_secret_key() -> str:
+    key = os.environ.get("SECRET_KEY", "")
+    if key:
+        return key
+    if os.path.exists(SECRET_KEY_FILE):
+        with open(SECRET_KEY_FILE) as f:
+            return f.read().strip()
+    # O_CREAT|O_EXCL makes file creation atomic: if two processes race here
+    # on first boot, only one wins the create and the loser reads back
+    # whatever the winner wrote, so both end up with the same key. Mode 0o600
+    # also keeps the file unreadable by anyone but the app's own user.
+    new_key = secrets.token_hex(32)
+    try:
+        fd = os.open(SECRET_KEY_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(new_key)
+        return new_key
+    except FileExistsError:
+        with open(SECRET_KEY_FILE) as f:
+            return f.read().strip()
+
+_token_signer = URLSafeTimedSerializer(_load_secret_key(), salt="ms-auth")
+
+def _cred_fp(credential: str) -> str:
+    return hashlib.sha256((credential or "").encode()).hexdigest()[:12]
+
+def _current_credential(role: str, subject: str) -> str | None:
+    """Live credential the token fingerprint must match — rotating it
+    (password change, parent-code regen) invalidates outstanding tokens."""
+    if role == "school":
+        s = get_school(subject)
+        return s.get("password_hash") if s else None
+    if role == "teacher":
+        t = get_teacher(subject)
+        return t.get("password_hash") if t and t.get("active", "true") == "true" else None
+    if role == "parent":
+        st = get_student(subject)
+        return st.get("parent_code") if st else None
+    return None
+
+def issue_token(role: str, subject: str, credential: str) -> str:
+    return _token_signer.dumps({"r": role, "s": subject, "h": _cred_fp(credential)})
+
+def verify_token(token: str, expected_role: str, max_age: int) -> dict | None:
+    if not token:
+        return None
+    try:
+        payload = _token_signer.loads(token, max_age=max_age)
+    except Exception:
+        return None
+    if payload.get("r") != expected_role:
+        return None
+    cred = _current_credential(payload.get("r", ""), payload.get("s", ""))
+    if cred is None or _cred_fp(cred) != payload.get("h"):
+        return None
+    return payload
+
+def _bearer_payload(request: Request, role: str) -> dict | None:
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None
+    return verify_token(auth.removeprefix("Bearer ").strip(), role, TOKEN_MAX_AGE_MOBILE)
 
 
 # ── Teacher helpers ────────────────────────────────────────────────────────────
@@ -208,6 +434,13 @@ def get_teacher_by_email(email: str) -> dict | None:
     return next((t for t in _read_csv(TEACHERS_FILE, TEACHERS_HEADERS)
                  if t["email"] == email and t.get("active", "true") == "true"), None)
 
+def _update_teacher(teacher_id: str, **kwargs):
+    rows = _read_csv(TEACHERS_FILE, TEACHERS_HEADERS)
+    for r in rows:
+        if r["teacher_id"] == teacher_id:
+            r.update(kwargs)
+    _write_csv(TEACHERS_FILE, TEACHERS_HEADERS, rows)
+
 
 # ── Student helpers ────────────────────────────────────────────────────────────
 def get_students(teacher_id: str) -> list[dict]:
@@ -219,8 +452,173 @@ def get_all_school_students(school_id: str) -> list[dict]:
             if s["school_id"] == school_id]
 
 def get_student(student_id: str) -> dict | None:
+    """Fetch by id across EVERY school. Callers must check ownership.
+
+    Kept unscoped because the school-admin views legitimately reach students
+    they do not teach. Anything acting on behalf of a teacher should use
+    _own_student instead — five write routes used this directly and never
+    compared teacher_id, which is how money could be moved between schools.
+    """
     return next((s for s in _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
                  if s["student_id"] == student_id), None)
+
+
+def _own_student(teacher: dict, student_id: str) -> dict | None:
+    """The student, but only if this teacher actually teaches them.
+
+    student_id arrives from the URL, so it is attacker-controlled. Every
+    teacher-acting route that reads or writes a student goes through here.
+    """
+    student = get_student(student_id)
+    if not student or student.get("teacher_id") != (teacher or {}).get("teacher_id"):
+        return None
+    return student
+
+
+# ── Per-teacher calendar sync (iCal) ────────────────────────────────────────────
+# One JSON store keyed by teacher_id, mirroring push_tokens.json's pattern for
+# per-entity data that doesn't fit the flat CSV headers. Deliberately iCal-only
+# (no Google OAuth) for now — see chat: per-teacher Google OAuth needs a signed
+# state param and Google's sensitive-scope verification review before it can
+# safely serve real users across many teachers, which is an external, multi-
+# week dependency, not just code. iCal needs no OAuth and covers Google
+# Calendar, Apple Calendar, and Outlook the same way via their share links.
+TEACHER_CALENDARS_FILE = "/data/teacher_calendars.json"
+
+def _load_teacher_calendars() -> dict:
+    if not os.path.exists(TEACHER_CALENDARS_FILE):
+        return {}
+    try:
+        with open(TEACHER_CALENDARS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_teacher_calendars(data: dict):
+    with open(TEACHER_CALENDARS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def get_teacher_calendar_settings(teacher_id: str) -> dict:
+    defaults = {
+        "ical_url": "",
+        "lesson_keywords": ["lesson", "private", "student", "class", "music",
+                            "piano", "guitar", "violin", "drums", "voice"],
+        "show_all": True,
+    }
+    defaults.update(_load_teacher_calendars().get(teacher_id, {}))
+    return defaults
+
+def save_teacher_calendar_settings(teacher_id: str, settings: dict):
+    data = _load_teacher_calendars()
+    data[teacher_id] = {**get_teacher_calendar_settings(teacher_id), **settings}
+    _save_teacher_calendars(data)
+
+def _fetch_ical_events(ical_url: str, days: int = 28) -> list:
+    """Fetch events from an iCal URL, Google Calendar event-shaped output.
+    Ported from the Studio App's proven parser — same minimal VEVENT scanner."""
+    try:
+        import urllib.request as _ur
+        with _ur.urlopen(ical_url, timeout=10) as resp:
+            raw = resp.read().decode('utf-8', errors='ignore')
+        events = []
+        now    = datetime.now()
+        cutoff = now + timedelta(days=days)
+        for block in raw.split('BEGIN:VEVENT'):
+            if 'END:VEVENT' not in block:
+                continue
+            block = block[:block.index('END:VEVENT')]
+            def _field(name):
+                for line in block.splitlines():
+                    if line.startswith(name + ':') or line.startswith(name + ';'):
+                        return line.split(':', 1)[-1].strip()
+                return ''
+            summary = _field('SUMMARY')
+            dtstart = _field('DTSTART')
+            dtend   = _field('DTEND')
+            def _parse_dt(s):
+                s = s.replace('Z', '').replace('-', '').replace(':', '')
+                try:
+                    if len(s) == 8:
+                        return datetime.strptime(s, '%Y%m%d')
+                    return datetime.strptime(s[:15], '%Y%m%dT%H%M%S')
+                except Exception:
+                    return None
+            start_dt = _parse_dt(dtstart)
+            end_dt   = _parse_dt(dtend)
+            if not start_dt or not (now <= start_dt <= cutoff):
+                continue
+            is_allday = len(dtstart.replace('Z', '')) == 8
+            if is_allday:
+                start_val = {'date': start_dt.strftime('%Y-%m-%d')}
+                end_val   = {'date': (end_dt or start_dt).strftime('%Y-%m-%d')}
+            else:
+                start_val = {'dateTime': start_dt.strftime('%Y-%m-%dT%H:%M:%S')}
+                end_val   = {'dateTime': (end_dt or start_dt).strftime('%Y-%m-%dT%H:%M:%S')}
+            events.append({'summary': summary, 'start': start_val, 'end': end_val})
+        events.sort(key=lambda e: e['start'].get('dateTime', e['start'].get('date', '')))
+        return events
+    except Exception as ex:
+        print(f"iCal fetch error: {ex}")
+        return []
+
+def clean_student_name(title: str) -> str:
+    name = title.strip()
+    for p in [
+        r'^private\s+lesson\s*[:–\-]\s*',
+        r'^lesson\s+with\s+',
+        r'^lesson\s*[:–\-]\s*',
+        r'^(?:piano|guitar|violin|drums|voice|music)\s+lesson\s*[:–\-]\s*',
+    ]:
+        name = re.sub(p, '', name, flags=re.IGNORECASE).strip()
+    for s in [
+        r"\s*'s\s+(?:\w+\s+)*(?:private\s+)?lesson$",
+        r'\s*[-–]\s*private\s+lesson$',
+        r'\s*[-–]\s*lesson$',
+        r'\s*\(\d+\s*min\w*\)$',
+    ]:
+        name = re.sub(s, '', name, flags=re.IGNORECASE).strip()
+    return name
+
+def get_teacher_today_calendar_events(teacher_id: str) -> list:
+    settings = get_teacher_calendar_settings(teacher_id)
+    if not settings.get("ical_url"):
+        return []
+    all_events = _fetch_ical_events(settings["ical_url"], days=1)
+    today = datetime.now().strftime('%Y-%m-%d')
+    return [e for e in all_events
+            if e['start'].get('dateTime', '').startswith(today) or e['start'].get('date', '') == today]
+
+
+# ── Make-up lessons: credits + bookable slots ──────────────────────────────────
+# Keyed by student_id/teacher_id (not name) to avoid the ambiguity risk of
+# name-keyed storage across a multi-teacher, multi-school platform.
+MAKEUP_CREDITS_FILE = "/data/makeup_credits.json"
+MAKEUP_SLOTS_FILE   = "/data/makeup_slots.json"
+
+def _load_makeup_credits() -> dict:
+    if not os.path.exists(MAKEUP_CREDITS_FILE):
+        return {}
+    with open(MAKEUP_CREDITS_FILE) as f:
+        return json.load(f)
+
+def _save_makeup_credits(c: dict):
+    with open(MAKEUP_CREDITS_FILE, "w") as f:
+        json.dump(c, f, indent=2)
+
+def _issue_makeup_credit(student_id: str):
+    credits = _load_makeup_credits()
+    credits[student_id] = credits.get(student_id, 0) + 1
+    _save_makeup_credits(credits)
+
+def _load_makeup_slots() -> list:
+    if not os.path.exists(MAKEUP_SLOTS_FILE):
+        return []
+    with open(MAKEUP_SLOTS_FILE) as f:
+        return json.load(f)
+
+def _save_makeup_slots(slots: list):
+    with open(MAKEUP_SLOTS_FILE, "w") as f:
+        json.dump(slots, f, indent=2)
 
 
 # ── Revenue helpers ────────────────────────────────────────────────────────────
@@ -297,7 +695,7 @@ def school_page(title, content, active):
         ("students",  "/school/students",  "👥", "All Students"),
         ("analytics", "/school/analytics", "📊", "Analytics"),
         ("policies",  "/school/policies",  "📋", "Policies"),
-        ("billing",   "/school/billing",   "💳", "Billing"),
+        ("broadcast", "/school/broadcast", "📣", "Broadcast"),
         ("settings",  "/school/settings",  "⚙️",  "Settings"),
     ], "/school/logout")
 
@@ -309,8 +707,11 @@ def teacher_page(title, content, active):
         ("notes",      "/teacher/notes",              "📝", "Notes"),
         ("attendance", "/teacher/attendance-history", "📋", "Attendance"),
         ("payments",   "/teacher/payments",           "💳", "Payments"),
+        ("invoices",   "/teacher/invoices",           "🧾", "Invoices"),
         ("analytics",  "/teacher/analytics",          "📊", "Analytics"),
         ("schedule",   "/teacher/schedule",           "📅", "Schedule"),
+        ("makeup",     "/teacher/makeup",              "🔄", "Make-ups"),
+        ("broadcast",  "/teacher/broadcast",           "📣", "Broadcast"),
     ], "/teacher/logout")
 
 
@@ -325,7 +726,7 @@ def parent_page(title, content, active):
 # ── Login pages ────────────────────────────────────────────────────────────────
 def _login_html(title: str, action: str, fields: str, error: str = "",
                 signup_link: str = "", extra: str = "") -> str:
-    err = f'<div class="alert alert-danger">{error}</div>' if error else ""
+    err = f'<div class="alert alert-danger">{_esc(error)}</div>' if error else ""
     sig = f'<p style="text-align:center;margin-top:14px;font-size:13px;">{signup_link}</p>' if signup_link else ""
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -355,17 +756,203 @@ def _login_html(title: str, action: str, fields: str, error: str = "",
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ROOT
 # ═══════════════════════════════════════════════════════════════════════════════
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return RedirectResponse("/school/login")
+
+
+def _legal_page(title: str, body_html: str) -> str:
+    return f"""<!DOCTYPE html><html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title} — Music School App</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  body{{font-family:'Inter',-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;
+       max-width:760px;margin:0 auto;padding:48px 24px 80px;line-height:1.7;}}
+  h1{{font-size:28px;font-weight:800;margin-bottom:6px;color:#f0f4ff;}}
+  .updated{{color:#64748b;font-size:13px;margin-bottom:36px;}}
+  h2{{font-size:19px;font-weight:700;margin:32px 0 10px;color:#f0f4ff;}}
+  p,li{{color:#cbd5e1;font-size:15px;}}
+  ul{{padding-left:22px;margin-bottom:14px;}}
+  li{{margin-bottom:6px;}}
+  a{{color:#818cf8;}}
+  .back{{display:inline-block;margin-bottom:28px;color:#818cf8;text-decoration:none;font-size:14px;font-weight:600;}}
+  .notice{{background:#1e1b3a;border:1px solid #4c1d95;border-radius:10px;padding:14px 18px;
+          margin-bottom:28px;font-size:13px;color:#c4b5fd;}}
+</style></head><body>
+<a href="/school/login" class="back">← Back to login</a>
+{body_html}
+</body></html>"""
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy_page():
+    body = """
+<h1>Privacy Policy</h1>
+<div class="updated">Last updated: July 14, 2026</div>
+
+<p>This Privacy Policy explains how Robert Ollech ("we", "us") collects, uses, and protects information through Music School App (the "Service"), a tool for music schools to manage teachers, students, lessons, attendance, and payments.</p>
+
+<h2>Who uses this Service</h2>
+<p>Music School App is used by a school administrator to manage their school. The school admin invites teachers, who each manage their own roster of students. Parents may be given a separate login (an access code) by their child's teacher to view lesson notes, attendance, and make payments, and to review and sign school policies.</p>
+
+<h2>Information we collect</h2>
+<ul>
+  <li><strong>School and teacher account data:</strong> school name, owner name/email, teacher name/email, password (stored as a salted hash, never in plain text), subscription status.</li>
+  <li><strong>Student data, entered by the school or teacher:</strong> student name, lesson notes, assignments, attendance records, and payment/balance information.</li>
+  <li><strong>Parent data:</strong> parent email/access codes used to log in to the parent portal, and policy signatures.</li>
+  <li><strong>Payment information:</strong> processed entirely by Stripe. We never see or store full card numbers.</li>
+  <li><strong>Usage data:</strong> basic page-view logs and feature-usage events, used only to improve the product.</li>
+</ul>
+
+<h2>Children's data and COPPA</h2>
+<p>Most students managed through this Service are children under 13. We do not knowingly collect information directly from children through this Service — all student information is entered by the school or teacher as part of managing music lessons, not through any interaction by the child with the Service itself. The school is responsible for its own relationship with students and parents, and for any consent required under applicable law (including COPPA) for the information it chooses to enter about a student.</p>
+<p>Parents may contact their child's school at any time to review, correct, or request deletion of their child's information. If you are a parent with a privacy concern we can help with directly, contact us at robertcollech@gmail.com.</p>
+
+<h2>How we use information</h2>
+<ul>
+  <li>To operate the Service: storing and displaying lesson notes, schedules, attendance, and payment records across a school's teachers and students.</li>
+  <li>To process subscription payments via Stripe.</li>
+  <li>To send transactional emails (teacher invites, confirmations, invoices) via SendGrid.</li>
+  <li>To send push notifications for lesson reminders and note updates, if enabled.</li>
+  <li>To maintain backups for disaster recovery (stored with Cloudflare R2).</li>
+</ul>
+
+<h2>Who we share data with</h2>
+<p>We use the following service providers (sub-processors) to operate the Service. We do not sell your data.</p>
+<ul>
+  <li><strong>Stripe</strong> — payment processing</li>
+  <li><strong>SendGrid</strong> — transactional email delivery</li>
+  <li><strong>Expo</strong> — push notification delivery. If push notifications are enabled, the device push token and the notification content (which may include a student's first name, e.g. "New note for [name]") are sent to Expo's push service to be delivered to the device.</li>
+  <li><strong>Cloudflare R2</strong> — encrypted off-site backup storage</li>
+  <li><strong>Google Fonts</strong> — our pages load a web font from Google's servers, which receives the viewer's IP address as part of that request</li>
+  <li><strong>Render</strong> — application hosting</li>
+</ul>
+
+<h2>Data retention and deletion</h2>
+<p>We retain school, teacher, and student data for as long as the school's account is active. A school admin can remove teachers, and teachers can remove students, at any time. To request deletion of a school's account or data, email robertcollech@gmail.com; we will process deletion requests within a reasonable time, subject to what we need to retain for legal, tax, or dispute-resolution purposes.</p>
+
+<h2>Security</h2>
+<p>Passwords are hashed with bcrypt. Sessions use signed, time-limited tokens. Data is encrypted in transit (HTTPS). Backups are stored off-site and access-restricted. No system is perfectly secure, and we cannot guarantee absolute security.</p>
+
+<h2>Your choices</h2>
+<p>School admins and teachers can update or delete their own account information at any time from Settings. Parents should contact their child's school or teacher to update or remove information, since the school controls that data.</p>
+
+<h2>Changes to this policy</h2>
+<p>We may update this policy from time to time. Material changes will be reflected by updating the "Last updated" date above.</p>
+
+<h2>Contact</h2>
+<p>Questions about this policy: robertcollech@gmail.com</p>
+"""
+    return HTMLResponse(_legal_page("Privacy Policy", body))
+
+
+@app.get("/terms", response_class=HTMLResponse)
+def terms_page():
+    body = """
+<h1>Terms of Service</h1>
+<div class="updated">Last updated: July 14, 2026</div>
+
+<p>These Terms of Service ("Terms") govern your use of Music School App (the "Service"), operated by Robert Ollech ("we", "us"). By creating a school account, you agree to these Terms on behalf of your school.</p>
+
+<h2>The Service</h2>
+<p>Music School App is a subscription tool for music schools to manage teachers, students, scheduling, attendance, lesson notes, and payments. You are responsible for the accuracy of the information entered by your school and its teachers, and for your own compliance with any laws that apply to your school, including obligations to your students and their parents.</p>
+
+<h2>Accounts</h2>
+<p>The school admin is responsible for inviting and managing teacher accounts, and for all activity under the school's account, including actions taken by teachers the school has invited. Parent portal access is granted by the school or teacher, who is responsible for managing who has access.</p>
+
+<h2>Subscription, trial, and billing</h2>
+<ul>
+  <li>New school accounts receive a 30-day free trial with full access.</li>
+  <li>A valid payment card is required to start a trial. You will not be charged during the trial.</li>
+  <li>After the trial ends, your card will be charged $99/month unless you cancel first.</li>
+  <li>You can cancel anytime from Settings; cancellation takes effect at the end of the current billing period, and you will not be charged again.</li>
+  <li>Fees are non-refundable except where required by law.</li>
+</ul>
+
+<h2>Acceptable use</h2>
+<p>You agree not to use the Service to store or transmit unlawful content, to attempt to gain unauthorized access to other schools' accounts or our systems, or to use the Service in a way that could harm students, parents, or other users.</p>
+
+<h2>Your content</h2>
+<p>Your school retains ownership of the student, lesson, and payment data entered by its teachers. You grant us the right to store and process it solely to provide the Service to your school. Your school is responsible for having any necessary rights or consents to enter information about its students and their parents.</p>
+
+<h2>Data export and account closure</h2>
+<p>Your school admin can download a backup of school data at any time from Settings. If your school closes its account, we will delete its data within a reasonable period, subject to backup retention and legal requirements.</p>
+
+<h2>Disclaimers</h2>
+<p>The Service is provided "as is" without warranties of any kind. We do not guarantee the Service will be uninterrupted or error-free. We are not responsible for disputes between your school and its teachers, students, or their parents.</p>
+
+<h2>Limitation of liability</h2>
+<p>To the maximum extent permitted by law, our total liability for any claim arising from your use of the Service is limited to the amount your school paid us in the 12 months before the claim arose.</p>
+
+<h2>Termination</h2>
+<p>We may suspend or terminate accounts that violate these Terms or that we reasonably believe pose a risk to the Service or other users.</p>
+
+<h2>Governing law</h2>
+<p>These Terms are governed by the laws of the State of California, United States, without regard to conflict-of-law principles.</p>
+
+<h2>Changes to these Terms</h2>
+<p>We may update these Terms from time to time. Continued use of the Service after a change constitutes acceptance of the updated Terms.</p>
+
+<h2>Contact</h2>
+<p>Questions about these Terms: robertcollech@gmail.com</p>
+"""
+    return HTMLResponse(_legal_page("Terms of Service", body))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SCHOOL ADMIN — signup / login / dashboard
 # ═══════════════════════════════════════════════════════════════════════════════
+# Public signup is CLOSED.
+#
+# WHY. Five write routes take a student_id straight from the URL and never
+# check the student belongs to the signed-in teacher:
+#   POST /teacher/students/{id}/payment       — no ownership check at all
+#   POST /teacher/students/{id}/charge        — checks the student exists only
+#   POST /teacher/students/{id}/attendance    — checks the student exists only
+#   POST /api/mobile/teacher/students/{id}/charge   — same
+#   POST /api/mobile/teacher/students/{id}/payment  — same
+# Any teacher account can therefore move money on any student at any OTHER
+# school, and the ledger row is written under the attacker's school_id, so it
+# corrupts both schools' books at once. Reads are correctly scoped; it is the
+# writes that leak.
+#
+# This is a stopgap and NOT the fix, exactly as it was for LessonBase in
+# 81d96ecc. No invite code makes a new account safe while the write paths are
+# unscoped, because the hole is open to every account, not just new ones.
+# Reopen only after the ownership checks land AND a regression test proves a
+# second school cannot touch the first school's rows.
+SIGNUP_OPEN = False
+
+_SIGNUP_CLOSED_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Not open yet — Music School</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="login-wrap">
+  <div class="login-card">
+    <div class="login-logo">🎵</div>
+    <h1 style="text-align:center;margin-bottom:8px;font-size:20px;">Not open yet</h1>
+    <p style="text-align:center;color:var(--muted);font-size:14px;line-height:1.6;">
+      Music School isn't accepting new schools right now. If you already have an
+      account you can still <a href="/school/login" style="color:var(--primary);font-weight:600;">sign in</a>.
+    </p>
+  </div>
+</div>
+</body>
+</html>"""
+
+
 @app.get("/school/signup", response_class=HTMLResponse)
 def school_signup_page(error: str = ""):
-    err = f'<div class="alert alert-danger">{error}</div>' if error else ""
+    # A plain page rather than a 404: the public landing page links here with
+    # "Get Early Access", and a dead end tells an interested teacher nothing.
+    if not SIGNUP_OPEN:
+        return HTMLResponse(_SIGNUP_CLOSED_HTML, status_code=403)
+    err = f'<div class="alert alert-danger">{_esc(error)}</div>' if error else ""
     return HTMLResponse(f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -401,6 +988,11 @@ def school_signup_page(error: str = ""):
       <button type="submit" class="btn" style="width:100%;justify-content:center;padding:10px;margin-top:4px;">
         Create School</button>
     </form>
+    <p style="text-align:center;margin-top:12px;font-size:12px;color:var(--muted);">
+      By creating an account you agree to our
+      <a href="/terms" target="_blank" style="color:var(--primary);">Terms of Service</a> and
+      <a href="/privacy" target="_blank" style="color:var(--primary);">Privacy Policy</a>.
+    </p>
     <p style="text-align:center;margin-top:14px;font-size:13px;color:var(--muted);">
       Already have an account? <a href="/school/login" style="color:var(--primary);font-weight:600;">Sign in</a>
     </p>
@@ -411,27 +1003,41 @@ def school_signup_page(error: str = ""):
 
 @app.post("/school/signup")
 async def school_signup_post(
+    request:     Request,
     school_name: str = Form(...),
     owner_name:  str = Form(...),
     email:       str = Form(...),
     password:    str = Form(...),
 ):
+    # Checked before anything else, so no rate-limit state, no CSV row and no
+    # cookie can be created while signup is closed.
+    if not SIGNUP_OPEN:
+        return HTMLResponse(_SIGNUP_CLOSED_HTML, status_code=403)
+    ip = _client_ip(request)
+    if _rl_blocked(ip):
+        return RedirectResponse("/school/signup?error=Too+many+attempts.+Try+again+in+10+minutes.", status_code=303)
+    _rl_fail(ip)  # count every signup attempt against the IP
     email = email.strip().lower()
     if get_school_by_email(email):
         return RedirectResponse(f"/school/signup?error=Email+already+registered", status_code=303)
-    school_id = secrets.token_hex(8)
+    school_id  = secrets.token_hex(8)
+    trial_ends = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+    pw_hash    = _hash_password(password)
     _append_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, {
-        "school_id":    school_id,
-        "name":         school_name.strip(),
-        "owner_email":  email,
-        "owner_name":   owner_name.strip(),
-        "password_hash": _hash(password),
-        "plan":         "starter",
-        "created_at":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "active":       "true",
+        "school_id":     school_id,
+        "name":          school_name.strip(),
+        "owner_email":   email,
+        "owner_name":    owner_name.strip(),
+        "password_hash": pw_hash,
+        "plan":          "trial",
+        "created_at":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "active":        "true",
+        "trial_ends":    trial_ends,
+        "is_subscribed": "false",
     })
-    resp = RedirectResponse("/school/dashboard?toast=Welcome!+Your+school+is+ready.", status_code=303)
-    resp.set_cookie("school_id", school_id, httponly=True, max_age=86400 * 30)
+    resp = RedirectResponse("/school/subscribe", status_code=303)
+    resp.set_cookie("school_id", issue_token("school", school_id, pw_hash),
+                    httponly=True, secure=True, samesite="lax", max_age=TOKEN_MAX_AGE_WEB)
     return resp
 
 
@@ -444,21 +1050,29 @@ def school_login_page(error: str = ""):
         <input type="password" name="password" placeholder="••••••••" required></div>"""
     return HTMLResponse(_login_html(
         "School Admin Login", "/school/login", fields, error,
-        signup_link='No account? <a href="/school/signup" style="color:var(--primary);font-weight:600;">Create your school</a>',
+        # No "create your school" link while signup is closed — it would
+        # dead-end anyone who followed it.
+        signup_link=('No account? <a href="/school/signup" style="color:var(--primary);font-weight:600;">Create your school</a>'
+                     if SIGNUP_OPEN else ''),
         extra='<p style="text-align:center;margin-top:10px;font-size:13px;color:var(--muted);">Teacher? <a href="/teacher/login" style="color:var(--primary);font-weight:600;">Teacher login →</a></p>',
     ))
 
 
 @app.post("/school/login")
 async def school_login_post(request: Request, email: str = Form(...), password: str = Form(...)):
-    ip = request.client.host
+    ip = _client_ip(request)
     if _rl_blocked(ip):
         return RedirectResponse("/school/login?error=Too+many+attempts.+Try+again+in+10+minutes.", status_code=303)
     school = get_school_by_email(email.strip().lower())
-    if school and school["password_hash"] == _hash(password):
+    if school and _check_password(password, school["password_hash"]):
         _rl_clear(ip)
+        stored = school["password_hash"]
+        if _needs_rehash(stored):
+            stored = _hash_password(password)
+            _update_school(school["school_id"], password_hash=stored)
         resp = RedirectResponse("/school/dashboard", status_code=303)
-        resp.set_cookie("school_id", school["school_id"], httponly=True, max_age=86400 * 30)
+        resp.set_cookie("school_id", issue_token("school", school["school_id"], stored),
+                        httponly=True, secure=True, samesite="lax", max_age=TOKEN_MAX_AGE_WEB)
         return resp
     _rl_fail(ip)
     return RedirectResponse("/school/login?error=Invalid+email+or+password", status_code=303)
@@ -472,8 +1086,114 @@ def school_logout():
 
 
 def _require_school(request: Request) -> dict | None:
-    sid = request.cookies.get("school_id", "")
-    return get_school(sid) if sid else None
+    payload = verify_token(request.cookies.get("school_id", ""), "school", TOKEN_MAX_AGE_WEB)
+    return get_school(payload["s"]) if payload else None
+
+def _school_access_response(school: dict) -> RedirectResponse | None:
+    """Returns a redirect if school lacks access, else None."""
+    has_access, _ = school_has_access(school)
+    if not has_access:
+        return RedirectResponse("/school/subscribe", status_code=303)
+    return None
+
+
+@app.get("/school/subscribe", response_class=HTMLResponse)
+def school_subscribe_page(request: Request, success: str = "", cancelled: str = ""):
+    school = _require_school(request)
+    if not school:
+        return RedirectResponse("/school/login", status_code=303)
+
+    if success:
+        if STRIPE_SECRET_KEY:
+            try:
+                stripe.api_key = STRIPE_SECRET_KEY
+                sess = stripe.checkout.Session.retrieve(success)
+                if sess.get("payment_status") in ("paid", "no_payment_required") or sess.get("status") == "complete":
+                    _update_school(school["school_id"], is_subscribed="true", plan="school")
+            except Exception:
+                pass
+        return RedirectResponse("/school/dashboard?toast=Welcome%21+Your+subscription+is+active.", status_code=303)
+
+    has_access, reason = school_has_access(school)
+    if reason == "subscribed":
+        return RedirectResponse("/school/dashboard", status_code=303)
+
+    days_left = school_trial_days(school)
+
+    trial_html = ""
+    if reason == "trial" and days_left > 0:
+        trial_html = (
+            f'<div style="background:#1e3a2e;border:1px solid #166534;border-radius:12px;'
+            f'padding:14px 18px;margin-bottom:20px;color:#86efac;font-size:14px;font-weight:600;">'
+            f'✅ Free trial active — <strong>{days_left} day{"s" if days_left != 1 else ""} remaining</strong>. '
+            f'Add a card now to keep access after your trial ends.</div>'
+        )
+
+    expired_html = "" if reason == "trial" else (
+        '<div style="background:#3b1515;border:1px solid #7f1d1d;border-radius:10px;padding:12px 16px;'
+        'margin-bottom:20px;color:#fca5a5;font-size:14px;font-weight:600;">'
+        '⏰ Your free trial has ended. Subscribe to continue.</div>'
+    )
+
+    cancelled_html = (
+        '<div style="background:#3b1515;border:1px solid #7f1d1d;border-radius:10px;padding:12px 16px;'
+        'margin-bottom:16px;color:#fca5a5;font-size:13px;">Checkout cancelled — no charge was made.</div>'
+        if cancelled else ""
+    )
+
+    stripe_btn = (
+        '<form action="/school/billing/checkout" method="post" style="margin:0;">'
+        '<input type="hidden" name="plan" value="school">'
+        '<button type="submit" style="width:100%;padding:16px;background:linear-gradient(135deg,#6366f1,#8b5cf6);'
+        'color:#fff;border:none;border-radius:12px;font-size:16px;font-weight:700;cursor:pointer;">'
+        '🎵 Start Free Trial — $99/month after 30 days</button></form>'
+    ) if STRIPE_SECRET_KEY else (
+        '<div style="background:#1e293b;border-radius:12px;padding:14px;color:#94a3b8;font-size:13px;text-align:center;">'
+        'Payment system not configured yet.</div>'
+    )
+
+    content = f"""
+<div style="max-width:480px;margin:80px auto;padding:0 16px;">
+  <div style="text-align:center;margin-bottom:32px;">
+    <div style="font-size:48px;margin-bottom:12px;">🏫</div>
+    <h1 style="font-size:26px;font-weight:800;color:#f0f4ff;margin:0 0 6px;">Music School App</h1>
+    <p style="color:#64748b;font-size:15px;margin:0;">Multi-teacher school management platform.</p>
+  </div>
+  <div style="background:#1e293b;border:1px solid #2e3f5c;border-radius:16px;padding:28px;">
+    {cancelled_html}{expired_html}{trial_html}
+    <div style="margin-bottom:22px;">
+      <div style="font-size:13px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;">What's included</div>
+      {"".join(f'<div style="display:flex;align-items:center;gap:10px;padding:7px 0;font-size:14px;color:#e2e8f0;">✅ {f}</div>' for f in [
+        'Unlimited teachers & students',
+        'Per-teacher lesson & attendance tracking',
+        'Parent & student portals',
+        'School-wide analytics',
+        'Policy management & digital signing',
+        'Automated billing & invoicing',
+        'Push notifications',
+      ])}
+    </div>
+    <div style="border-top:1px solid #2e3f5c;padding-top:20px;">
+      {stripe_btn}
+      <p style="text-align:center;font-size:12px;color:#64748b;margin-top:10px;">
+        Card required · No charge for 30 days · Cancel anytime
+      </p>
+    </div>
+  </div>
+  <div style="text-align:center;margin-top:16px;">
+    <a href="/terms" target="_blank" style="color:#475569;font-size:12px;text-decoration:none;">Terms</a>
+    <span style="color:#475569;font-size:12px;"> · </span>
+    <a href="/privacy" target="_blank" style="color:#475569;font-size:12px;text-decoration:none;">Privacy</a>
+    <span style="color:#475569;font-size:12px;"> · </span>
+    <a href="/school/logout" style="color:#475569;font-size:12px;text-decoration:none;">Log out</a>
+  </div>
+</div>"""
+    return HTMLResponse(f"""<!DOCTYPE html><html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Subscribe — Music School App</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
+</head><body style="background:#0f172a;min-height:100vh;">{content}</body></html>""")
 
 
 @app.get("/school/dashboard", response_class=HTMLResponse)
@@ -481,6 +1201,36 @@ def school_dashboard(request: Request):
     school = _require_school(request)
     if not school:
         return RedirectResponse("/school/login", status_code=303)
+
+    gate = _school_access_response(school)
+    if gate: return gate
+
+    _, reason = school_has_access(school)
+    days_left  = school_trial_days(school)
+    trial_banner = ""
+    if school.get("subscription_status", "") in ("past_due", "unpaid"):
+        trial_banner = (
+            '<div style="background:#2a1414;border:1px solid #ef4444;border-radius:10px;'
+            'padding:12px 16px;margin-bottom:16px;display:flex;align-items:center;'
+            'justify-content:space-between;flex-wrap:wrap;gap:10px;">'
+            '<span style="color:#ef4444;font-size:14px;font-weight:600;">'
+            '⚠️ Your last payment failed. Update your card to avoid losing access.</span>'
+            '<a href="/school/settings" style="padding:6px 14px;background:#6366f1;color:#fff;'
+            'border-radius:8px;font-size:13px;font-weight:700;text-decoration:none;">Update Payment Method</a>'
+            '</div>'
+        )
+    elif reason == "trial" and days_left <= 10:
+        color = "#f59e0b" if days_left > 5 else "#ef4444"
+        trial_banner = (
+            f'<div style="background:#1c1410;border:1px solid {color};border-radius:10px;'
+            f'padding:12px 16px;margin-bottom:16px;display:flex;align-items:center;'
+            f'justify-content:space-between;flex-wrap:wrap;gap:10px;">'
+            f'<span style="color:{color};font-size:14px;font-weight:600;">'
+            f'⏰ Free trial ends in <strong>{days_left} day{"s" if days_left != 1 else ""}</strong>.</span>'
+            f'<a href="/school/subscribe" style="padding:6px 14px;background:#6366f1;color:#fff;'
+            f'border-radius:8px;font-size:13px;font-weight:700;text-decoration:none;">Add Card Now</a>'
+            f'</div>'
+        )
 
     teachers = get_teachers(school["school_id"])
     students = get_all_school_students(school["school_id"])
@@ -516,6 +1266,7 @@ def school_dashboard(request: Request):
     <tbody>{teacher_rows}</tbody>
   </table>
 </div>"""
+    content = trial_banner + content
     return HTMLResponse(school_page("Dashboard", content, "dashboard"))
 
 
@@ -524,6 +1275,8 @@ def school_dashboard(request: Request):
 def school_teachers(request: Request):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
 
     teachers = get_teachers(school["school_id"])
     students = get_all_school_students(school["school_id"])
@@ -558,7 +1311,9 @@ def school_teachers(request: Request):
 def school_invite_page(request: Request, error: str = ""):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
-    err = f'<div class="alert alert-danger">{error}</div>' if error else ""
+    gate = _school_access_response(school)
+    if gate: return gate
+    err = f'<div class="alert alert-danger">{_esc(error)}</div>' if error else ""
     content = f"""
 <div style="max-width:480px;">
   <h1 style="margin-bottom:20px;">Invite a Teacher</h1>
@@ -585,6 +1340,8 @@ async def school_invite_post(request: Request,
     name: str = Form(...), email: str = Form(...)):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
     email    = email.strip().lower()
     password = secrets.token_urlsafe(10)
     if get_teacher_by_email(email):
@@ -595,7 +1352,7 @@ async def school_invite_post(request: Request,
         "school_id":     school["school_id"],
         "name":          name.strip(),
         "email":         email,
-        "password_hash": _hash(password),
+        "password_hash": _hash_password(password),
         "created_at":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "active":        "true",
     })
@@ -644,6 +1401,8 @@ async def school_invite_post(request: Request,
 def school_teacher_detail(teacher_id: str, request: Request):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
     teacher  = get_teacher(teacher_id)
     if not teacher or teacher["school_id"] != school["school_id"]:
         return RedirectResponse("/school/teachers", status_code=303)
@@ -681,6 +1440,8 @@ def school_teacher_detail(teacher_id: str, request: Request):
 def school_remove_teacher(teacher_id: str, request: Request):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
     rows = _read_csv(TEACHERS_FILE, TEACHERS_HEADERS)
     for r in rows:
         if r["teacher_id"] == teacher_id and r["school_id"] == school["school_id"]:
@@ -694,6 +1455,8 @@ def school_remove_teacher(teacher_id: str, request: Request):
 def school_students(request: Request):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
     students = get_all_school_students(school["school_id"])
     teachers = {t["teacher_id"]: t["name"] for t in get_teachers(school["school_id"])}
 
@@ -722,6 +1485,8 @@ def school_students(request: Request):
 def school_analytics(request: Request):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
     sid      = school["school_id"]
     teachers = get_teachers(sid)
     students = get_all_school_students(sid)
@@ -788,11 +1553,39 @@ new Chart(document.getElementById('chart'),{{type:'bar',data:{{labels:D.labels,d
 def school_settings(request: Request, toast: str = ""):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
-    t = f'<div class="alert alert-success">{toast}</div>' if toast else ""
+    gate = _school_access_response(school)
+    if gate: return gate
+    t = f'<div class="alert alert-success">{_esc(toast)}</div>' if toast else ""
+    has_access, reason = school_has_access(school)
+    days_left = school_trial_days(school)
+    sub_status = school.get("subscription_status", "")
+    if reason == "subscribed" and sub_status in ("past_due", "unpaid"):
+        billing_status = '<span style="color:#ef4444;font-weight:700;">⚠️ Payment failed — update your card</span>'
+        billing_action = '<form action="/school/billing/portal" method="post" style="margin:0;"><button type="submit" class="btn btn-sm" style="background:#ef4444;color:#fff;border:none;">Update Payment Method</button></form>'
+    elif reason == "subscribed":
+        billing_status = '<span style="color:#10b981;font-weight:700;">✅ Active subscription — $99/month</span>'
+        billing_action = '<form action="/school/billing/portal" method="post" style="margin:0;"><button type="submit" class="btn btn-outline btn-sm">Manage Subscription</button></form>'
+    elif reason == "trial":
+        billing_status = f'<span style="color:#f59e0b;font-weight:700;">🕐 Free trial — {days_left} day{"s" if days_left != 1 else ""} left</span>'
+        billing_action = '<a href="/school/subscribe" class="btn btn-sm" style="background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border:none;">Add Card — $99/mo after trial</a>'
+    else:
+        billing_status = '<span style="color:#ef4444;font-weight:700;">⏰ Trial expired</span>'
+        billing_action = '<a href="/school/subscribe" class="btn btn-sm" style="background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border:none;">Subscribe — $99/mo</a>'
+
     content = f"""
 <div style="max-width:480px;">
   <h1 style="margin-bottom:20px;">Settings</h1>
   {t}
+  <div class="card" style="margin-bottom:16px;">
+    <h3 style="margin-bottom:16px;">💳 Billing</h3>
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
+      <div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:4px;">Current plan</div>
+        {billing_status}
+      </div>
+      {billing_action}
+    </div>
+  </div>
   <div class="card">
     <h3 style="margin-bottom:16px;">School Info</h3>
     <form action="/school/settings" method="post">
@@ -822,6 +1615,8 @@ async def school_settings_post(request: Request,
     school_name: str = Form(...), owner_name: str = Form(...)):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
     rows = _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
     for r in rows:
         if r["school_id"] == school["school_id"]:
@@ -836,14 +1631,17 @@ async def school_password_post(request: Request,
     current_password: str = Form(...), new_password: str = Form(...)):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
-    if school["password_hash"] != _hash(current_password):
+    gate = _school_access_response(school)
+    if gate: return gate
+    if not _check_password(current_password, school["password_hash"]):
         return RedirectResponse("/school/settings?toast=Incorrect+current+password", status_code=303)
-    rows = _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
-    for r in rows:
-        if r["school_id"] == school["school_id"]:
-            r["password_hash"] = _hash(new_password)
-    _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, rows)
-    return RedirectResponse("/school/settings?toast=Password+updated", status_code=303)
+    new_hash = _hash_password(new_password)
+    _update_school(school["school_id"], password_hash=new_hash)
+    # Password change invalidates all outstanding tokens; reissue this session's
+    resp = RedirectResponse("/school/settings?toast=Password+updated", status_code=303)
+    resp.set_cookie("school_id", issue_token("school", school["school_id"], new_hash),
+                    httponly=True, secure=True, samesite="lax", max_age=TOKEN_MAX_AGE_WEB)
+    return resp
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -864,14 +1662,19 @@ def teacher_login_page(error: str = ""):
 
 @app.post("/teacher/login")
 async def teacher_login_post(request: Request, email: str = Form(...), password: str = Form(...)):
-    ip = request.client.host
+    ip = _client_ip(request)
     if _rl_blocked(ip):
         return RedirectResponse("/teacher/login?error=Too+many+attempts.+Try+again+in+10+minutes.", status_code=303)
     teacher = get_teacher_by_email(email.strip().lower())
-    if teacher and teacher["password_hash"] == _hash(password) and teacher.get("active","true") == "true":
+    if teacher and teacher.get("active","true") == "true" and _check_password(password, teacher["password_hash"]):
         _rl_clear(ip)
+        stored = teacher["password_hash"]
+        if _needs_rehash(stored):
+            stored = _hash_password(password)
+            _update_teacher(teacher["teacher_id"], password_hash=stored)
         resp = RedirectResponse("/teacher/dashboard", status_code=303)
-        resp.set_cookie("teacher_id", teacher["teacher_id"], httponly=True, max_age=86400 * 30)
+        resp.set_cookie("teacher_id", issue_token("teacher", teacher["teacher_id"], stored),
+                        httponly=True, secure=True, samesite="lax", max_age=TOKEN_MAX_AGE_WEB)
         return resp
     _rl_fail(ip)
     return RedirectResponse("/teacher/login?error=Invalid+email+or+password", status_code=303)
@@ -885,8 +1688,8 @@ def teacher_logout():
 
 
 def _require_teacher(request: Request) -> dict | None:
-    tid = request.cookies.get("teacher_id", "")
-    return get_teacher(tid) if tid else None
+    payload = verify_token(request.cookies.get("teacher_id", ""), "teacher", TOKEN_MAX_AGE_WEB)
+    return get_teacher(payload["s"]) if payload else None
 
 
 @app.get("/teacher/dashboard", response_class=HTMLResponse)
@@ -904,7 +1707,7 @@ def teacher_dashboard(request: Request):
 
     bal_rows = "".join(
         f'<div style="display:flex;align-items:center;justify-content:space-between;padding:9px 0;border-bottom:1px solid var(--border);">'
-        f'<span style="font-weight:600;">{"🟢" if float(s.get("prepaid",0))>0 else "🔴"} {s["name"]}</span>'
+        f'<span style="font-weight:600;">{"🟢" if float(s.get("prepaid",0))>0 else "🔴"} {_esc(s["name"])}</span>'
         f'<span style="color:{"var(--success)" if float(s.get("prepaid",0))>0 else "var(--danger)"};font-weight:700;">${float(s.get("prepaid",0)):.2f}</span>'
         f'</div>'
         for s in students
@@ -912,7 +1715,7 @@ def teacher_dashboard(request: Request):
 
     content = f"""
 <h1>Dashboard</h1>
-<p style="color:var(--muted);margin-bottom:20px;">Welcome back, {teacher['name']}!</p>
+<p style="color:var(--muted);margin-bottom:20px;">Welcome back, {_esc(teacher['name'])}!</p>
 <div class="stats-row">
   <div class="stat-card"><div class="stat-icon" style="background:#ede9fe;">👥</div><div class="stat-val">{len(students)}</div><div class="stat-lbl">Students</div></div>
   <div class="stat-card"><div class="stat-icon" style="background:#d1fae5;">💰</div><div class="stat-val">${this_month:.2f}</div><div class="stat-lbl">This Month</div></div>
@@ -967,7 +1770,7 @@ def teacher_students(request: Request):
 def teacher_add_student_page(request: Request, error: str = ""):
     teacher = _require_teacher(request)
     if not teacher: return RedirectResponse("/teacher/login", status_code=303)
-    err = f'<div class="alert alert-danger">{error}</div>' if error else ""
+    err = f'<div class="alert alert-danger">{_esc(error)}</div>' if error else ""
     content = f"""
 <div style="max-width:480px;">
   <h1 style="margin-bottom:20px;">Add Student</h1>
@@ -1031,8 +1834,8 @@ def teacher_student_detail(student_id: str, request: Request, toast: str = ""):
     notes_html = "".join(
         f'<div style="padding:12px 0;border-bottom:1px solid var(--border);">'
         f'<div style="font-size:11px;color:var(--muted);">{n.get("date","")}</div>'
-        f'<div style="font-size:13px;margin-top:4px;">{n.get("notes","")}</div>'
-        + (f'<div style="font-size:12px;color:var(--success);margin-top:4px;"><strong>Assignment:</strong> {n["assignment"]}</div>' if n.get("assignment","").strip() else "")
+        f'<div style="font-size:13px;margin-top:4px;">{_esc(n.get("notes",""))}</div>'
+        + (f'<div style="font-size:12px;color:var(--success);margin-top:4px;"><strong>Assignment:</strong> {_esc(n["assignment"])}</div>' if n.get("assignment","").strip() else "")
         + '</div>'
         for n in notes[:5]
     ) or '<p style="color:var(--muted);font-size:13px;">No notes yet.</p>'
@@ -1044,7 +1847,7 @@ def teacher_student_detail(student_id: str, request: Request, toast: str = ""):
     att_pct    = f"{confirmed/(confirmed+missed)*100:.0f}%" if (confirmed+missed) > 0 else "—"
     credits    = sum(1 for r in att if r["status"] == "Cancelled")
 
-    t_html = f'<div class="alert alert-success">{toast}</div>' if toast else ""
+    t_html = f'<div class="alert alert-success">{_esc(toast)}</div>' if toast else ""
     content = f"""
 {t_html}
 <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:10px;">
@@ -1108,15 +1911,20 @@ def teacher_student_detail(student_id: str, request: Request, toast: str = ""):
 async def teacher_record_payment(student_id: str, request: Request, amount: float = Form(...)):
     teacher = _require_teacher(request)
     if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    student = _own_student(teacher, student_id)
+    if not student: return RedirectResponse("/teacher/students", status_code=303)
     rows = _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
     for r in rows:
-        if r["student_id"] == student_id:
+        # teacher_id is matched here too, not only in the guard above. If the
+        # guard is ever dropped the write still cannot cross schools — this
+        # loop is the thing that actually moves the money.
+        if r["student_id"] == student_id and r["teacher_id"] == teacher["teacher_id"]:
             r["prepaid"] = f"{float(r.get('prepaid',0)) + amount:.2f}"
     _write_csv(STUDENTS_FILE, STUDENTS_HEADERS, rows)
     _append_csv(LEDGER_FILE, LEDGER_HEADERS, {
         "id": secrets.token_hex(6), "school_id": teacher["school_id"],
         "teacher_id": teacher["teacher_id"], "student_id": student_id,
-        "student_name": get_student(student_id).get("name",""),
+        "student_name": student.get("name",""),
         "date": datetime.now().strftime("%Y-%m-%d"),
         "status": "Payment", "amount": f"{amount:.2f}", "notes": "",
     })
@@ -1127,16 +1935,17 @@ async def teacher_record_payment(student_id: str, request: Request, amount: floa
 async def teacher_charge_student(student_id: str, request: Request, amount: float = Form(...)):
     teacher = _require_teacher(request)
     if not teacher: return RedirectResponse("/teacher/login", status_code=303)
-    student = get_student(student_id)
+    student = _own_student(teacher, student_id)
+    if not student: return RedirectResponse("/teacher/students", status_code=303)
     rows = _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
     for r in rows:
-        if r["student_id"] == student_id:
+        if r["student_id"] == student_id and r["teacher_id"] == teacher["teacher_id"]:
             r["prepaid"] = f"{float(r.get('prepaid',0)) - amount:.2f}"
     _write_csv(STUDENTS_FILE, STUDENTS_HEADERS, rows)
     _append_csv(LEDGER_FILE, LEDGER_HEADERS, {
         "id": secrets.token_hex(6), "school_id": teacher["school_id"],
         "teacher_id": teacher["teacher_id"], "student_id": student_id,
-        "student_name": student.get("name","") if student else "",
+        "student_name": student.get("name",""),
         "date": datetime.now().strftime("%Y-%m-%d"),
         "status": "Lesson Charged", "amount": f"-{amount:.2f}", "notes": "",
     })
@@ -1148,7 +1957,7 @@ async def teacher_record_attendance(student_id: str, request: Request,
     date: str = Form(...), status: str = Form(...)):
     teacher = _require_teacher(request)
     if not teacher: return RedirectResponse("/teacher/login", status_code=303)
-    student = get_student(student_id)
+    student = _own_student(teacher, student_id)
     if not student: return RedirectResponse("/teacher/students", status_code=303)
     rate = float(student.get("rate", 50))
     # Confirmed = charge lesson; Cancelled = give make-up credit (no charge); Missed = charge
@@ -1157,9 +1966,11 @@ async def teacher_record_attendance(student_id: str, request: Request,
         amount = -rate
         rows = _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
         for r in rows:
-            if r["student_id"] == student_id:
+            if r["student_id"] == student_id and r["teacher_id"] == teacher["teacher_id"]:
                 r["prepaid"] = f"{float(r.get('prepaid',0)) - rate:.2f}"
         _write_csv(STUDENTS_FILE, STUDENTS_HEADERS, rows)
+    elif status == "Cancelled":
+        _issue_makeup_credit(student_id)
     _append_csv(LEDGER_FILE, LEDGER_HEADERS, {
         "id": secrets.token_hex(6), "school_id": teacher["school_id"],
         "teacher_id": teacher["teacher_id"], "student_id": student_id,
@@ -1389,7 +2200,7 @@ async def teacher_add_note_post(request: Request,
     notes: str = Form(""), assignment: str = Form("")):
     teacher = _require_teacher(request)
     if not teacher: return RedirectResponse("/teacher/login", status_code=303)
-    student = get_student(student_id)
+    student = _own_student(teacher, student_id)
     if student:
         _save_note_and_notify(teacher, student_id, student, date,
                               notes.strip(), assignment.strip())
@@ -1459,16 +2270,18 @@ async def teacher_record_payment_post(request: Request,
     date: str = Form(...), notes: str = Form("")):
     teacher = _require_teacher(request)
     if not teacher: return RedirectResponse("/teacher/login", status_code=303)
-    student = get_student(student_id)
+    student = _own_student(teacher, student_id)
+    if not student:
+        return RedirectResponse("/teacher/payments?toast=Student+not+found", status_code=303)
     rows = _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
     for r in rows:
-        if r["student_id"] == student_id:
+        if r["student_id"] == student_id and r["teacher_id"] == teacher["teacher_id"]:
             r["prepaid"] = f"{float(r.get('prepaid',0)) + amount:.2f}"
     _write_csv(STUDENTS_FILE, STUDENTS_HEADERS, rows)
     _append_csv(LEDGER_FILE, LEDGER_HEADERS, {
         "id": secrets.token_hex(6), "school_id": teacher["school_id"],
         "teacher_id": teacher["teacher_id"], "student_id": student_id,
-        "student_name": student.get("name","") if student else "",
+        "student_name": student.get("name",""),
         "date": date, "status": "Payment",
         "amount": f"{amount:.2f}", "notes": notes.strip(),
     })
@@ -1510,19 +2323,101 @@ new Chart(document.getElementById('chart'),{{type:'bar',data:{{labels:D.labels,d
 
 # ── Teacher: Schedule placeholder ─────────────────────────────────────────────
 @app.get("/teacher/schedule", response_class=HTMLResponse)
-def teacher_schedule(request: Request):
+def teacher_schedule(request: Request, toast: str = ""):
     teacher = _require_teacher(request)
     if not teacher: return RedirectResponse("/teacher/login", status_code=303)
-    content = """
-<h1 style="margin-bottom:20px;">Schedule</h1>
-<div class="card">
-  <div class="empty-state">
-    <div class="empty-state-icon">📅</div>
-    <h3>Calendar Integration Coming Soon</h3>
-    <p>Connect Google Calendar or iCal to see your schedule here.</p>
-  </div>
+    settings = get_teacher_calendar_settings(teacher["teacher_id"])
+    toast_html = f'<div class="alert alert-success">{_esc(toast)}</div>' if toast else ""
+
+    settings_form = f"""
+<div class="card" style="max-width:520px;">
+  <h3 style="margin-bottom:12px;">{'🔗 Update' if settings['ical_url'] else '🔗 Connect'} Your Calendar</h3>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:14px;">
+    Paste your calendar's iCal share link — works with Google Calendar, Apple Calendar, and Outlook.
+  </p>
+  <form method="post" action="/teacher/schedule/settings">
+    <div class="form-group">
+      <label class="form-label">iCal URL</label>
+      <input type="url" name="ical_url" value="{_esc(settings['ical_url'])}"
+        placeholder="webcal://... or https://..." style="width:100%;box-sizing:border-box;">
+      <div style="font-size:11px;color:var(--muted);margin-top:4px;line-height:1.6;">
+        <strong>Google Calendar:</strong> Settings → your calendar → "Secret address in iCal format" &nbsp;|&nbsp;
+        <strong>Apple Calendar:</strong> Right-click calendar → Share → Copy Link &nbsp;|&nbsp;
+        <strong>Outlook:</strong> Settings → Shared calendars → Publish → ICS link
+      </div>
+    </div>
+    <div class="form-group" style="margin-top:10px;">
+      <label class="form-label">Lesson Keywords (comma separated)</label>
+      <textarea name="lesson_keywords" rows="2" style="width:100%;padding:9px 11px;border:1.5px solid var(--border);border-radius:8px;font-size:13px;font-family:inherit;resize:vertical;">{_esc(', '.join(settings['lesson_keywords']))}</textarea>
+      <div style="font-size:11px;color:var(--muted);margin-top:4px;">Events matching these words appear as lessons.</div>
+    </div>
+    <button type="submit" class="btn" style="margin-top:10px;">Save</button>
+  </form>
 </div>"""
+
+    schedule_html = ""
+    if settings["ical_url"]:
+        today_events = get_teacher_today_calendar_events(teacher["teacher_id"])
+        students     = get_students(teacher["teacher_id"])
+        student_names = {s["name"] for s in students}
+
+        rows = ""
+        for e in today_events:
+            summary  = e.get("summary", "Lesson")
+            start_dt = e.get("start", {}).get("dateTime", "")
+            t = "All day"
+            if start_dt:
+                try:
+                    t = datetime.fromisoformat(start_dt).strftime("%-I:%M %p")
+                except Exception:
+                    t = start_dt
+            cleaned = clean_student_name(summary)
+            matched = cleaned in student_names
+            badge = ('<span class="badge badge-success" style="margin-left:8px;">registered</span>' if matched
+                     else '<span class="badge badge-danger" style="margin-left:8px;">unregistered</span>')
+            rows += (f'<div style="padding:10px 0;border-bottom:1px solid var(--border);'
+                     f'display:flex;justify-content:space-between;align-items:center;">'
+                     f'<span>🎵 {_esc(summary)}{badge}</span>'
+                     f'<span style="color:var(--muted);font-size:12px;">{t}</span></div>')
+
+        unmatched = [clean_student_name(e.get("summary", "")) for e in today_events
+                     if clean_student_name(e.get("summary", "")) and clean_student_name(e.get("summary", "")) not in student_names]
+        unmatched_html = ""
+        if unmatched:
+            names_html = ', '.join(f'<strong>{_esc(n)}</strong>' for n in unmatched)
+            unmatched_html = (
+                f'<div style="background:#451a03;border:1px solid #92400e;border-radius:10px;padding:12px 16px;'
+                f'margin-bottom:12px;font-size:13px;color:#fde68a;">'
+                f'⚠️ {len(unmatched)} calendar event(s) didn\'t match a registered student: {names_html}. '
+                f'Check spelling or <a href="/teacher/students/add" style="color:#fbbf24;text-decoration:underline;">add the student</a>.</div>'
+            )
+
+        schedule_html = f"""
+<div class="card" style="margin-bottom:20px;">
+  <h3 style="margin-bottom:12px;">📅 Today's Lessons</h3>
+  {unmatched_html}
+  {rows or '<p style="color:var(--muted);font-size:13px;">No lessons scheduled today.</p>'}
+</div>"""
+
+    content = f"""
+<h1 style="margin-bottom:20px;">Schedule</h1>
+{toast_html}
+{schedule_html}
+{settings_form}"""
     return HTMLResponse(teacher_page("Schedule", content, "schedule"))
+
+
+@app.post("/teacher/schedule/settings")
+async def teacher_schedule_settings_post(request: Request,
+    ical_url: str = Form(""), lesson_keywords: str = Form("")):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    keywords = [k.strip() for k in lesson_keywords.split(",") if k.strip()]
+    save_teacher_calendar_settings(teacher["teacher_id"], {
+        "ical_url": ical_url.strip().replace("webcal://", "https://"),
+        "lesson_keywords": keywords,
+    })
+    return RedirectResponse("/teacher/schedule?toast=Calendar+settings+saved", status_code=303)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1541,7 +2436,7 @@ def parent_login_page(error: str = ""):
 @app.post("/parent/login")
 async def parent_login_post(request: Request,
     student_name: str = Form(...), parent_code: str = Form(...)):
-    ip = request.client.host
+    ip = _client_ip(request)
     if _rl_blocked(ip):
         return RedirectResponse("/parent/login?error=Too+many+attempts.+Try+again+in+10+minutes.", status_code=303)
     students = _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
@@ -1551,7 +2446,8 @@ async def parent_login_post(request: Request,
     if match:
         _rl_clear(ip)
         resp = RedirectResponse("/parent/dashboard", status_code=303)
-        resp.set_cookie("parent_student_id", match["student_id"], httponly=True, max_age=86400*30)
+        resp.set_cookie("parent_student_id", issue_token("parent", match["student_id"], match.get("parent_code", "")),
+                        httponly=True, secure=True, samesite="lax", max_age=TOKEN_MAX_AGE_WEB)
         return resp
     _rl_fail(ip)
     return RedirectResponse("/parent/login?error=Invalid+student+name+or+code", status_code=303)
@@ -1565,8 +2461,8 @@ def parent_logout():
 
 
 def _require_parent(request: Request) -> dict | None:
-    sid = request.cookies.get("parent_student_id","")
-    return get_student(sid) if sid else None
+    payload = verify_token(request.cookies.get("parent_student_id", ""), "parent", TOKEN_MAX_AGE_WEB)
+    return get_student(payload["s"]) if payload else None
 
 
 @app.get("/parent/dashboard", response_class=HTMLResponse)
@@ -1582,8 +2478,8 @@ def parent_dashboard(request: Request):
         latest_html = (
             f'<div class="card" style="border-color:#a5b4fc;">'
             f'<h3>📌 Latest Note — {latest.get("date","")}</h3>'
-            f'<p style="font-size:13px;margin:8px 0;">{latest.get("notes","")}</p>'
-            + (f'<div style="background:#f0fdf4;border-left:3px solid #10b981;padding:8px 12px;border-radius:0 6px 6px 0;font-size:13px;"><strong>Assignment:</strong> {latest["assignment"]}</div>' if latest.get("assignment","").strip() else "")
+            f'<p style="font-size:13px;margin:8px 0;">{_esc(latest.get("notes",""))}</p>'
+            + (f'<div style="background:#f0fdf4;border-left:3px solid #10b981;padding:8px 12px;border-radius:0 6px 6px 0;font-size:13px;"><strong>Assignment:</strong> {_esc(latest["assignment"])}</div>' if latest.get("assignment","").strip() else "")
             + "</div>"
         )
 
@@ -1593,7 +2489,7 @@ def parent_dashboard(request: Request):
     bal_color = "var(--success)" if prepaid > 0 else "var(--danger)"
 
     content = f"""
-<h1>Welcome, {student['name']}! 👋</h1>
+<h1>Welcome, {_esc(student['name'])}! 👋</h1>
 <p style="color:var(--muted);margin-bottom:20px;">Your student portal</p>
 <div class="stats-row">
   <div class="stat-card"><div class="stat-icon" style="background:#d1fae5;">💰</div>
@@ -1617,8 +2513,8 @@ def parent_notes(request: Request):
     notes_html = "".join(
         f'<div style="padding:16px;border:1px solid var(--border);border-radius:10px;margin-bottom:12px;">'
         f'<div style="font-size:11px;color:var(--muted);margin-bottom:6px;">{n.get("date","")}</div>'
-        + (f'<p style="margin:0 0 10px;font-size:13px;">{n["notes"]}</p>' if n.get("notes","").strip() else "")
-        + (f'<div style="background:#f0fdf4;border-left:3px solid #10b981;padding:8px 12px;border-radius:0 6px 6px 0;font-size:13px;"><strong>Assignment:</strong> {n["assignment"]}</div>' if n.get("assignment","").strip() else "")
+        + (f'<p style="margin:0 0 10px;font-size:13px;">{_esc(n["notes"])}</p>' if n.get("notes","").strip() else "")
+        + (f'<div style="background:#f0fdf4;border-left:3px solid #10b981;padding:8px 12px;border-radius:0 6px 6px 0;font-size:13px;"><strong>Assignment:</strong> {_esc(n["assignment"])}</div>' if n.get("assignment","").strip() else "")
         + '</div>'
         for n in notes
     ) or '<p style="color:var(--muted);">No notes yet.</p>'
@@ -1661,7 +2557,7 @@ def serve_css():
     return Response(content=CSS, media_type="text/css")
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {"ok": True}
 
@@ -1698,26 +2594,41 @@ def _send_push(token: str, title: str, body: str, data: dict = None):
 # ── School Admin mobile auth ───────────────────────────────────────────────────
 @app.post("/api/mobile/school/login")
 async def mobile_school_login(request: Request):
-    ip = request.client.host
+    ip = _client_ip(request)
     if _rl_blocked(ip):
         return JSONResponse({"ok": False, "error": "Too many attempts"}, status_code=429)
     data   = await request.json()
     email  = data.get("email", "").strip().lower()
     pw     = data.get("password", "")
     school = get_school_by_email(email)
-    if school and school["password_hash"] == _hash(pw):
+    if school and _check_password(pw, school["password_hash"]):
         _rl_clear(ip)
-        return JSONResponse({"ok": True, "session": school["school_id"],
+        stored = school["password_hash"]
+        if _needs_rehash(stored):
+            stored = _hash_password(pw)
+            _update_school(school["school_id"], password_hash=stored)
+        return JSONResponse({"ok": True,
+                             "session": issue_token("school", school["school_id"], stored),
                              "school_name": school["name"], "role": "school"})
     _rl_fail(ip)
     return JSONResponse({"ok": False, "error": "Invalid credentials"}, status_code=401)
 
 def _school_auth(request: Request) -> dict | None:
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer school:"):
-        return None
-    sid = auth.removeprefix("Bearer school:").strip()
-    return get_school(sid)
+    payload = _bearer_payload(request, "school")
+    return get_school(payload["s"]) if payload else None
+
+@app.get("/api/mobile/school/subscription-status")
+def mobile_school_subscription_status(request: Request):
+    school = _school_auth(request)
+    if not school: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    has_access, reason = school_has_access(school)
+    return JSONResponse({
+        "ok": True,
+        "active": has_access,
+        "reason": reason,  # 'subscribed' | 'trial' | 'expired'
+        "trial_days_remaining": school_trial_days(school),
+    })
+
 
 @app.get("/api/mobile/school/dashboard")
 def mobile_school_dashboard(request: Request):
@@ -1775,26 +2686,44 @@ def mobile_school_analytics(request: Request):
 # ── Teacher mobile auth ────────────────────────────────────────────────────────
 @app.post("/api/mobile/teacher/login")
 async def mobile_teacher_login(request: Request):
-    ip = request.client.host
+    ip = _client_ip(request)
     if _rl_blocked(ip):
         return JSONResponse({"ok": False, "error": "Too many attempts"}, status_code=429)
     data    = await request.json()
     email   = data.get("email", "").strip().lower()
     pw      = data.get("password", "")
     teacher = get_teacher_by_email(email)
-    if teacher and teacher["password_hash"] == _hash(pw) and teacher.get("active","true") == "true":
+    if teacher and teacher.get("active","true") == "true" and _check_password(pw, teacher["password_hash"]):
         _rl_clear(ip)
-        return JSONResponse({"ok": True, "session": teacher["teacher_id"],
+        stored = teacher["password_hash"]
+        if _needs_rehash(stored):
+            stored = _hash_password(pw)
+            _update_teacher(teacher["teacher_id"], password_hash=stored)
+        return JSONResponse({"ok": True,
+                             "session": issue_token("teacher", teacher["teacher_id"], stored),
                              "name": teacher["name"], "role": "teacher"})
     _rl_fail(ip)
     return JSONResponse({"ok": False, "error": "Invalid credentials"}, status_code=401)
 
 def _teacher_auth(request: Request) -> dict | None:
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer teacher:"):
-        return None
-    tid = auth.removeprefix("Bearer teacher:").strip()
-    return get_teacher(tid)
+    payload = _bearer_payload(request, "teacher")
+    return get_teacher(payload["s"]) if payload else None
+
+@app.get("/api/mobile/teacher/subscription-status")
+def mobile_teacher_subscription_status(request: Request):
+    teacher = _teacher_auth(request)
+    if not teacher: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    school = get_school(teacher.get("school_id", ""))
+    if not school:
+        return JSONResponse({"ok": True, "active": False, "reason": "expired", "trial_days_remaining": 0})
+    has_access, reason = school_has_access(school)
+    return JSONResponse({
+        "ok": True,
+        "active": has_access,
+        "reason": reason,
+        "trial_days_remaining": school_trial_days(school),
+    })
+
 
 @app.get("/api/mobile/teacher/dashboard")
 def mobile_teacher_dashboard(request: Request):
@@ -1876,11 +2805,13 @@ async def mobile_teacher_charge(student_id: str, request: Request):
     if not teacher: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
     data   = await request.json()
     amount = float(data.get("amount", 0))
-    student = get_student(student_id)
+    # Same 404 as a student who does not exist: a teacher probing ids should
+    # not learn which ones belong to another school.
+    student = _own_student(teacher, student_id)
     if not student: return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
     rows = _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
     for r in rows:
-        if r["student_id"] == student_id:
+        if r["student_id"] == student_id and r["teacher_id"] == teacher["teacher_id"]:
             r["prepaid"] = f"{float(r.get('prepaid', 0)) - amount:.2f}"
     _write_csv(STUDENTS_FILE, STUDENTS_HEADERS, rows)
     _append_csv(LEDGER_FILE, LEDGER_HEADERS, {
@@ -1898,11 +2829,11 @@ async def mobile_teacher_payment(student_id: str, request: Request):
     if not teacher: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
     data   = await request.json()
     amount = float(data.get("amount", 0))
-    student = get_student(student_id)
+    student = _own_student(teacher, student_id)
     if not student: return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
     rows = _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
     for r in rows:
-        if r["student_id"] == student_id:
+        if r["student_id"] == student_id and r["teacher_id"] == teacher["teacher_id"]:
             r["prepaid"] = f"{float(r.get('prepaid', 0)) + amount:.2f}"
     _write_csv(STUDENTS_FILE, STUDENTS_HEADERS, rows)
     _append_csv(LEDGER_FILE, LEDGER_HEADERS, {
@@ -1934,7 +2865,7 @@ async def mobile_teacher_add_note(request: Request):
     if not teacher: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
     data       = await request.json()
     student_id = data.get("student_id", "").strip()
-    student    = get_student(student_id)
+    student    = _own_student(teacher, student_id)
     if not student: return JSONResponse({"ok": False, "error": "student not found"}, status_code=404)
     _save_note_and_notify(teacher, student_id, student,
                           data.get("date", datetime.now().strftime("%Y-%m-%d")),
@@ -1969,7 +2900,7 @@ async def mobile_teacher_register_push(request: Request):
 # ── Parent mobile auth ─────────────────────────────────────────────────────────
 @app.post("/api/mobile/parent/login")
 async def mobile_parent_login(request: Request):
-    ip = request.client.host
+    ip = _client_ip(request)
     if _rl_blocked(ip):
         return JSONResponse({"ok": False, "error": "Too many attempts"}, status_code=429)
     data   = await request.json()
@@ -1980,17 +2911,15 @@ async def mobile_parent_login(request: Request):
                   if s["name"].lower() == name and s.get("parent_code", "") == code), None)
     if match:
         _rl_clear(ip)
-        return JSONResponse({"ok": True, "session": match["student_id"],
+        return JSONResponse({"ok": True,
+                             "session": issue_token("parent", match["student_id"], match.get("parent_code", "")),
                              "student_name": match["name"], "role": "parent"})
     _rl_fail(ip)
     return JSONResponse({"ok": False, "error": "Invalid name or code"}, status_code=401)
 
 def _parent_auth(request: Request) -> dict | None:
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer parent:"):
-        return None
-    sid = auth.removeprefix("Bearer parent:").strip()
-    return get_student(sid)
+    payload = _bearer_payload(request, "parent")
+    return get_student(payload["s"]) if payload else None
 
 @app.get("/api/mobile/parent/dashboard")
 def mobile_parent_dashboard(request: Request):
@@ -2046,6 +2975,50 @@ async def mobile_parent_register_push(request: Request):
     return JSONResponse({"ok": True})
 
 
+@app.get("/api/mobile/parent/makeup/credits")
+def mobile_parent_makeup_credits(request: Request):
+    student = _parent_auth(request)
+    if not student: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    credits = _load_makeup_credits()
+    return JSONResponse({"ok": True, "credits": credits.get(student["student_id"], 0)})
+
+
+@app.get("/api/mobile/parent/makeup/slots")
+def mobile_parent_makeup_slots(request: Request):
+    student = _parent_auth(request)
+    if not student: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    # Only slots from this student's own teacher — a slot offered by a
+    # different teacher (even in the same school) isn't relevant or bookable.
+    slots = [s for s in _load_makeup_slots()
+             if s["teacher_id"] == student["teacher_id"] and not s.get("booked_by")]
+    return JSONResponse({"ok": True, "slots": slots})
+
+
+@app.post("/api/mobile/parent/makeup/book")
+async def mobile_parent_book_makeup(request: Request):
+    student = _parent_auth(request)
+    if not student: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    data    = await request.json()
+    slot_id = data.get("slot_id", "").strip()
+    slots   = _load_makeup_slots()
+    slot    = next((s for s in slots if s["id"] == slot_id and not s.get("booked_by")), None)
+    if not slot or slot["teacher_id"] != student["teacher_id"]:
+        return JSONResponse({"ok": False, "error": "Slot not available"}, status_code=404)
+    credits = _load_makeup_credits()
+    if credits.get(student["student_id"], 0) <= 0:
+        return JSONResponse({"ok": False, "error": "No make-up credits"}, status_code=403)
+    slot["booked_by"] = student["student_id"]
+    _save_makeup_slots(slots)
+    credits[student["student_id"]] = max(0, credits[student["student_id"]] - 1)
+    _save_makeup_credits(credits)
+    token = _load_push_tokens().get(f"teacher:{student['teacher_id']}")
+    if token:
+        _send_push(token, "Make-up lesson booked",
+                  f"{student['name']} booked the {slot['date']} at {slot['time']} slot.",
+                  {"screen": "Makeup"})
+    return JSONResponse({"ok": True, "slot": slot, "credits_remaining": credits[student["student_id"]]})
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SESSION 2: Stripe billing · Push on note · Policy signing · Waitlist
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2059,9 +3032,15 @@ POLICIES_FILE = "/data/policies.csv"
 SIGNATURES_FILE = "/data/signatures.csv"
 
 WAITLIST_HEADERS   = ["id", "email", "created_at"]
-POLICIES_HEADERS   = ["id", "school_id", "title", "body", "created_at"]
+POLICIES_HEADERS   = ["id", "school_id", "title", "body", "created_at", "pdf_filename"]
 SIGNATURES_HEADERS = ["id", "policy_id", "school_id", "student_id",
                       "student_name", "signed_at"]
+INVOICES_FILE      = "/data/invoices.csv"
+INVOICES_HEADERS   = ["id", "school_id", "teacher_id", "student_id", "student_name",
+                      "month", "year", "scheduled_lessons", "total_amount",
+                      "amount_paid", "balance_due", "status", "created_date", "paid_date"]
+MONTH_NAMES = ['', 'January', 'February', 'March', 'April', 'May', 'June',
+               'July', 'August', 'September', 'October', 'November', 'December']
 
 PLAN_PRICES = {
     "school": os.environ.get("STRIPE_PRICE_SCHOOL", ""),   # $99/mo
@@ -2070,6 +3049,82 @@ PLAN_PRICES = {
 _init_csv(WAITLIST_FILE,   WAITLIST_HEADERS)
 _init_csv(POLICIES_FILE,   POLICIES_HEADERS)
 _init_csv(SIGNATURES_FILE, SIGNATURES_HEADERS)
+_init_csv(INVOICES_FILE,   INVOICES_HEADERS)
+
+def _migrate_policies():
+    if not os.path.exists(POLICIES_FILE):
+        return
+    with open(POLICIES_FILE, "r") as f:
+        r      = csv.DictReader(f)
+        fields = list(r.fieldnames or [])
+        rows   = [dict(row) for row in r]
+    if not set(POLICIES_HEADERS).issubset(set(fields)):
+        for row in rows:
+            row.setdefault("pdf_filename", "")
+        _write_csv(POLICIES_FILE, POLICIES_HEADERS, rows)
+
+_migrate_policies()
+
+
+# ── Invoices ─────────────────────────────────────────────────────────────────
+# Generated from actual recorded ledger charges for the month, not from
+# calendar-event counting like Studio App's version — every teacher has
+# ledger data, but not every teacher configures calendar sync (iCal is
+# optional here), so this works regardless of that setup.
+def get_all_invoices() -> list[dict]:
+    return _read_csv(INVOICES_FILE, INVOICES_HEADERS)
+
+def save_all_invoices(invoices: list[dict]):
+    _write_csv(INVOICES_FILE, INVOICES_HEADERS, invoices)
+
+def _display_invoice_status(inv: dict) -> str:
+    st = inv.get("status", "draft")
+    if st in ("draft", "sent"):
+        try:
+            now = datetime.now()
+            if (int(inv["year"]), int(inv["month"])) < (now.year, now.month):
+                return "overdue"
+        except Exception:
+            pass
+    return st
+
+def generate_invoices_for_teacher_month(teacher_id: str, school_id: str, year: int, month: int) -> int:
+    """Sums this teacher's ledger charges (negative amounts) per student for
+    the given month and creates one draft invoice per student with charges,
+    skipping students who already have an invoice for that month."""
+    invoices = get_all_invoices()
+    existing = {(i["student_id"], i["year"], i["month"]) for i in invoices
+                if i["teacher_id"] == teacher_id}
+    prefix = f"{year}-{month:02d}"
+    ledger = [r for r in _read_csv(LEDGER_FILE, LEDGER_HEADERS)
+              if r["teacher_id"] == teacher_id and r.get("date", "").startswith(prefix)
+              and float(r.get("amount", 0)) < 0]
+    by_student: dict[str, dict] = {}
+    for r in ledger:
+        sid = r["student_id"]
+        by_student.setdefault(sid, {"name": r.get("student_name", ""), "count": 0, "total": 0.0})
+        by_student[sid]["count"] += 1
+        by_student[sid]["total"] += abs(float(r.get("amount", 0)))
+
+    next_id = max((int(i.get("id") or 0) for i in invoices), default=0) + 1
+    added = 0
+    for student_id, data in by_student.items():
+        if (student_id, str(year), str(month)) in existing:
+            continue
+        total = round(data["total"], 2)
+        invoices.append({
+            "id": str(next_id), "school_id": school_id, "teacher_id": teacher_id,
+            "student_id": student_id, "student_name": data["name"],
+            "month": str(month), "year": str(year),
+            "scheduled_lessons": str(data["count"]),
+            "total_amount": f"{total:.2f}", "amount_paid": "0.00",
+            "balance_due": f"{total:.2f}", "status": "draft",
+            "created_date": datetime.now().strftime("%Y-%m-%d"), "paid_date": "",
+        })
+        next_id += 1
+        added += 1
+    save_all_invoices(invoices)
+    return added
 
 
 # ── Push helper: fire in background thread ─────────────────────────────────────
@@ -2084,6 +3139,406 @@ def _push_parent_note(student_id: str, student_name: str, teacher_name: str):
                   {"type": "note", "student_id": student_id}),
             daemon=True,
         ).start()
+
+
+# ── Broadcast ───────────────────────────────────────────────────────────────────
+@app.get("/teacher/invoices", response_class=HTMLResponse)
+def teacher_invoices_page(request: Request, toast: str = ""):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    all_inv = sorted(
+        [i for i in get_all_invoices() if i["teacher_id"] == teacher["teacher_id"]],
+        key=lambda x: (x.get("year", ""), x.get("month", "").zfill(2), x.get("student_name", "")),
+        reverse=True,
+    )
+    toast_html = f'<div class="alert alert-success">{_esc(toast)}</div>' if toast else ""
+    ST_STYLE = {
+        "paid": ("badge-success", "Paid"), "sent": ("badge-info", "Sent"),
+        "draft": ("badge-muted", "Draft"), "overdue": ("badge-danger", "Overdue"),
+    }
+    paid_inv    = [i for i in all_inv if i.get("status") == "paid"]
+    open_inv    = [i for i in all_inv if i.get("status") != "paid"]
+    outstanding = sum(float(i.get("balance_due", 0)) for i in open_inv)
+    overdue_ct  = sum(1 for i in all_inv if _display_invoice_status(i) == "overdue")
+
+    rows = ""
+    for inv in all_inv:
+        iid = inv.get("id", "")
+        m   = int(inv.get("month", 1) or 1)
+        label = f"{MONTH_NAMES[m][:3]} {inv.get('year', '')}"
+        dst = _display_invoice_status(inv)
+        bcls, blbl = ST_STYLE.get(dst, ("badge-muted", dst.title()))
+        bal = float(inv.get("balance_due", 0))
+        rows += (f'<tr><td><a href="/teacher/invoices/{iid}" style="color:var(--primary);font-weight:600;">#INV-{iid.zfill(4)}</a></td>'
+                 f'<td><strong>{_esc(inv.get("student_name",""))}</strong></td><td>{label}</td>'
+                 f'<td style="text-align:center;">{inv.get("scheduled_lessons","—")}</td>'
+                 f'<td>${float(inv.get("total_amount",0)):.2f}</td>'
+                 f'<td style="color:var(--success);font-weight:600;">${float(inv.get("amount_paid",0)):.2f}</td>'
+                 f'<td style="font-weight:700;color:{"var(--danger)" if bal>0 else "var(--success)"};">${bal:.2f}</td>'
+                 f'<td><span class="badge {bcls}">{blbl}</span></td>'
+                 f'<td><a href="/teacher/invoices/{iid}" class="btn btn-outline btn-sm">View</a></td></tr>')
+    if not rows:
+        rows = '<tr><td colspan="9" style="text-align:center;padding:24px;color:var(--muted);">No invoices yet — generate below.</td></tr>'
+
+    now = datetime.now()
+    cur_m, cur_y = now.month, now.year
+    opts = "".join(f'<option value="{i}"{" selected" if i==cur_m else ""}>{MONTH_NAMES[i]}</option>' for i in range(1, 13))
+
+    content = f"""
+{toast_html}
+<div class="stats-row">
+  <div class="stat-card"><div class="stat-icon" style="background:#e0e7ff;">🧾</div><div class="stat-val">{len(all_inv)}</div><div class="stat-lbl">Total</div></div>
+  <div class="stat-card"><div class="stat-icon" style="background:#d1fae5;">✅</div><div class="stat-val">{len(paid_inv)}</div><div class="stat-lbl">Paid</div></div>
+  <div class="stat-card"><div class="stat-icon" style="background:#fee2e2;">🔴</div><div class="stat-val">{overdue_ct}</div><div class="stat-lbl">Overdue</div></div>
+  <div class="stat-card"><div class="stat-icon" style="background:#fef3c7;">💰</div><div class="stat-val">${outstanding:.2f}</div><div class="stat-lbl">Outstanding</div></div>
+</div>
+<div class="card">
+  <h2 style="margin:0 0 12px;">🧾 Invoices</h2>
+  <table><thead><tr><th>Invoice</th><th>Student</th><th>Period</th><th style="text-align:center;">Lessons</th><th>Total</th><th>Paid</th><th>Balance</th><th>Status</th><th></th></tr></thead>
+  <tbody>{rows}</tbody></table>
+</div>
+<div class="card" style="max-width:440px;">
+  <h2>⚡ Generate Invoices</h2>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;">
+    Sums recorded lesson charges per student for the selected month and creates draft invoices.
+  </p>
+  <form action="/teacher/invoices/generate" method="post">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+      <div class="form-group" style="margin:0;"><label class="form-label">Month</label><select name="month">{opts}</select></div>
+      <div class="form-group" style="margin:0;"><label class="form-label">Year</label><input type="number" name="year" value="{cur_y}" min="2020" max="2035" required></div>
+    </div>
+    <button type="submit" class="btn" style="margin-top:14px;">⚡ Generate</button>
+  </form>
+</div>"""
+    return HTMLResponse(teacher_page("Invoices", content, "invoices"))
+
+
+@app.post("/teacher/invoices/generate")
+def teacher_generate_invoices(request: Request, month: int = Form(...), year: int = Form(...)):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    count = generate_invoices_for_teacher_month(teacher["teacher_id"], teacher["school_id"], year, month)
+    period = f"{MONTH_NAMES[month]} {year}"
+    toast = f"Generated {count} invoice(s) for {period}" if count else f"No new invoices for {period}"
+    return RedirectResponse(f"/teacher/invoices?toast={toast}", status_code=303)
+
+
+@app.get("/teacher/invoices/{invoice_id}", response_class=HTMLResponse)
+def teacher_invoice_detail(invoice_id: str, request: Request, toast: str = ""):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    inv = next((i for i in get_all_invoices()
+                if i["id"] == invoice_id and i["teacher_id"] == teacher["teacher_id"]), None)
+    if not inv: return RedirectResponse("/teacher/invoices", status_code=303)
+    toast_html = f'<div class="alert alert-success">{_esc(toast)}</div>' if toast else ""
+    m = int(inv.get("month", 1) or 1)
+    status = inv.get("status", "draft")
+    total  = float(inv.get("total_amount", 0))
+    paid   = float(inv.get("amount_paid", 0))
+    bal    = float(inv.get("balance_due", 0))
+    actions = ""
+    if status == "draft":
+        actions += f'<form action="/teacher/invoices/{invoice_id}/mark-sent" method="post" style="display:inline;"><button class="btn btn-outline btn-sm" type="submit">📤 Mark Sent</button></form> '
+    if status != "paid":
+        actions += f'<form action="/teacher/invoices/{invoice_id}/mark-paid" method="post" style="display:inline;"><button class="btn btn-success btn-sm" type="submit">✅ Mark Paid</button></form>'
+    content = f"""
+{toast_html}
+<div class="card" style="max-width:560px;">
+  <h2 style="margin-bottom:4px;">Invoice #INV-{invoice_id.zfill(4)}</h2>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:20px;">{_esc(inv.get('student_name',''))} — {MONTH_NAMES[m]} {inv.get('year','')}</p>
+  <table style="margin-bottom:18px;">
+    <tbody>
+      <tr><td>{inv.get('scheduled_lessons','')} lesson(s) charged</td><td style="text-align:right;font-weight:600;">${total:.2f}</td></tr>
+      <tr><td style="color:var(--success);">Amount Paid</td><td style="text-align:right;color:var(--success);font-weight:600;">-${paid:.2f}</td></tr>
+      <tr style="border-top:2px solid var(--border);"><td style="font-weight:700;">Balance Due</td>
+        <td style="text-align:right;font-weight:800;font-size:18px;color:{'var(--success)' if bal<=0 else 'var(--danger)'};">${bal:.2f}</td></tr>
+    </tbody>
+  </table>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;">
+    {actions}
+    <a href="/teacher/invoices" class="btn btn-outline">← All Invoices</a>
+  </div>
+</div>"""
+    return HTMLResponse(teacher_page(f"Invoice #INV-{invoice_id.zfill(4)}", content, "invoices"))
+
+
+@app.post("/teacher/invoices/{invoice_id}/mark-sent")
+def teacher_mark_invoice_sent(invoice_id: str, request: Request):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    invoices = get_all_invoices()
+    for inv in invoices:
+        if inv["id"] == invoice_id and inv["teacher_id"] == teacher["teacher_id"] and inv.get("status") == "draft":
+            inv["status"] = "sent"
+    save_all_invoices(invoices)
+    return RedirectResponse(f"/teacher/invoices/{invoice_id}?toast=Invoice+marked+as+sent", status_code=303)
+
+
+@app.post("/teacher/invoices/{invoice_id}/mark-paid")
+def teacher_mark_invoice_paid(invoice_id: str, request: Request):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    invoices = get_all_invoices()
+    target = None
+    for inv in invoices:
+        if inv["id"] == invoice_id and inv["teacher_id"] == teacher["teacher_id"]:
+            target = inv
+            inv["status"]      = "paid"
+            inv["paid_date"]   = datetime.now().strftime("%Y-%m-%d")
+            inv["amount_paid"] = inv.get("total_amount", "0.00")
+            inv["balance_due"] = "0.00"
+    save_all_invoices(invoices)
+    if target:
+        _append_csv(LEDGER_FILE, LEDGER_HEADERS, {
+            "id": secrets.token_hex(6), "school_id": target["school_id"],
+            "teacher_id": target["teacher_id"], "student_id": target["student_id"],
+            "student_name": target.get("student_name", ""),
+            "date": datetime.now().strftime("%Y-%m-%d"), "status": "Payment",
+            "amount": target.get("total_amount", "0.00"),
+            "notes": f"Invoice #{invoice_id} — {MONTH_NAMES[int(target.get('month',1) or 1)]} {target.get('year','')}",
+        })
+    return RedirectResponse(f"/teacher/invoices/{invoice_id}?toast=Invoice+marked+as+paid", status_code=303)
+
+
+@app.get("/teacher/makeup", response_class=HTMLResponse)
+def teacher_makeup_page(request: Request, toast: str = ""):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    students = get_students(teacher["teacher_id"])
+    credits  = _load_makeup_credits()
+    slots    = [s for s in _load_makeup_slots() if s["teacher_id"] == teacher["teacher_id"]]
+    toast_html = f'<div class="alert alert-success">{_esc(toast)}</div>' if toast else ""
+
+    credit_rows = "".join(
+        f'<tr><td>{_esc(s["name"])}</td>'
+        f'<td><span class="badge badge-info">{credits.get(s["student_id"], 0)} credit(s)</span></td>'
+        f'<td>'
+        f'<form method="post" action="/teacher/makeup/adjust" style="display:inline;">'
+        f'<input type="hidden" name="student_id" value="{s["student_id"]}">'
+        f'<input type="hidden" name="delta" value="1">'
+        f'<button class="btn btn-sm btn-outline" type="submit">+1</button></form> '
+        f'<form method="post" action="/teacher/makeup/adjust" style="display:inline;">'
+        f'<input type="hidden" name="student_id" value="{s["student_id"]}">'
+        f'<input type="hidden" name="delta" value="-1">'
+        f'<button class="btn btn-sm btn-outline" type="submit">-1</button></form>'
+        f'</td></tr>'
+        for s in students
+    ) or '<tr><td colspan="3" style="text-align:center;color:var(--muted);">No students yet.</td></tr>'
+
+    slot_rows = "".join(
+        f'<tr><td>{s["date"]} at {s["time"]}</td><td>{s["duration"]} min</td>'
+        f'<td>{"<span class=\'badge badge-success\'>Booked: " + _esc(next((st["name"] for st in students if st["student_id"]==s["booked_by"]), "?")) + "</span>" if s.get("booked_by") else "<span class=\'badge badge-info\'>Open</span>"}</td>'
+        f'<td>{"" if s.get("booked_by") else f"""<form method='post' action='/teacher/makeup/slots/{s["id"]}/delete' style='display:inline;'><button class='btn btn-sm btn-outline' type='submit'>Remove</button></form>"""}</td></tr>'
+        for s in slots
+    ) or '<tr><td colspan="4" style="text-align:center;color:var(--muted);">No make-up slots yet.</td></tr>'
+
+    content = f"""
+{toast_html}
+<h1 style="margin-bottom:20px;">🔄 Make-up Lessons</h1>
+<div class="card" style="margin-bottom:20px;">
+  <h3 style="margin-bottom:12px;">Student Credits</h3>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:14px;">
+    A credit is issued automatically when you mark a lesson "Cancelled." Parents use a credit to book an open slot below.
+  </p>
+  <table><thead><tr><th>Student</th><th>Credits</th><th>Adjust</th></tr></thead>
+  <tbody>{credit_rows}</tbody></table>
+</div>
+<div class="card" style="margin-bottom:20px;">
+  <h3 style="margin-bottom:12px;">Make-up Slots</h3>
+  <table><thead><tr><th>When</th><th>Duration</th><th>Status</th><th></th></tr></thead>
+  <tbody>{slot_rows}</tbody></table>
+</div>
+<div class="card" style="max-width:480px;">
+  <h3 style="margin-bottom:12px;">Add a Slot</h3>
+  <form method="post" action="/teacher/makeup/slots/add">
+    <div class="form-group"><label class="form-label">Date</label>
+      <input type="date" name="date" required></div>
+    <div class="form-group"><label class="form-label">Time</label>
+      <input type="time" name="time" required></div>
+    <div class="form-group"><label class="form-label">Duration (minutes)</label>
+      <input type="number" name="duration" value="30" min="15" step="15" required></div>
+    <button class="btn" type="submit" style="margin-top:8px;">Add Slot</button>
+  </form>
+</div>"""
+    return HTMLResponse(teacher_page("Make-up Lessons", content, "makeup"))
+
+
+@app.post("/teacher/makeup/adjust")
+def teacher_makeup_adjust(request: Request, student_id: str = Form(...), delta: int = Form(...)):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    student = get_student(student_id)
+    if not student or student["teacher_id"] != teacher["teacher_id"]:
+        return RedirectResponse("/teacher/makeup", status_code=303)
+    credits = _load_makeup_credits()
+    credits[student_id] = max(0, credits.get(student_id, 0) + delta)
+    _save_makeup_credits(credits)
+    return RedirectResponse("/teacher/makeup?toast=Credits+updated", status_code=303)
+
+
+@app.post("/teacher/makeup/slots/add")
+def teacher_makeup_add_slot(request: Request,
+    date: str = Form(...), time: str = Form(...), duration: int = Form(30)):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    slots = _load_makeup_slots()
+    slot_id = secrets.token_hex(6)
+    slots.append({
+        "id": slot_id, "school_id": teacher["school_id"], "teacher_id": teacher["teacher_id"],
+        "date": date, "time": time, "duration": duration, "booked_by": None,
+    })
+    _save_makeup_slots(slots)
+    # Notify parents of students with unused credits under this teacher
+    tokens   = _load_push_tokens()
+    credits  = _load_makeup_credits()
+    students = get_students(teacher["teacher_id"])
+    for s in students:
+        if credits.get(s["student_id"], 0) > 0:
+            token = tokens.get(f"parent:{s['student_id']}")
+            if token:
+                _send_push(token, "Make-up slot available",
+                          f"A make-up lesson slot opened on {date} at {time}. Tap to book.",
+                          {"screen": "Makeup"})
+    return RedirectResponse("/teacher/makeup?toast=Slot+added", status_code=303)
+
+
+@app.post("/teacher/makeup/slots/{slot_id}/delete")
+def teacher_makeup_delete_slot(slot_id: str, request: Request):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    slots = [s for s in _load_makeup_slots()
+             if not (s["id"] == slot_id and s["teacher_id"] == teacher["teacher_id"] and not s.get("booked_by"))]
+    _save_makeup_slots(slots)
+    return RedirectResponse("/teacher/makeup?toast=Slot+removed", status_code=303)
+
+
+@app.get("/teacher/broadcast", response_class=HTMLResponse)
+def teacher_broadcast_page(request: Request, sent: str = "", error: str = ""):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    students = get_students(teacher["teacher_id"])
+    tokens = _load_push_tokens()
+    parent_count = len([s for s in students if tokens.get(f"parent:{s['student_id']}")])
+    banner = ""
+    if sent:
+        banner = f'<div class="alert alert-success" style="margin-bottom:20px;">✅ Message sent to {sent} parent(s).</div>'
+    if error:
+        banner = f'<div class="alert alert-danger" style="margin-bottom:20px;">❌ {_esc(error)}</div>'
+    content = f"""
+{banner}
+<div class="card" style="max-width:640px;">
+  <h2 style="margin-top:0;">📣 Broadcast to Parents</h2>
+  <p style="color:var(--muted);font-size:14px;margin-bottom:24px;">
+    Send a push notification to your students' parents ({parent_count} registered).
+  </p>
+  <form method="post" action="/teacher/broadcast">
+    <div class="form-group">
+      <label class="form-label">Title</label>
+      <input type="text" name="title" placeholder="e.g. Lesson cancelled Saturday" required maxlength="100" style="width:100%;box-sizing:border-box;">
+    </div>
+    <div class="form-group" style="margin-top:14px;">
+      <label class="form-label">Message</label>
+      <textarea name="body" rows="4" placeholder="e.g. No lesson this Saturday. See you next week!" required maxlength="300" style="width:100%;padding:8px 11px;border:1.5px solid var(--border);border-radius:8px;font-size:13px;font-family:inherit;resize:vertical;"></textarea>
+    </div>
+    <button type="submit" class="btn" style="margin-top:16px;width:100%;">Send Notification</button>
+  </form>
+</div>"""
+    return HTMLResponse(teacher_page("Broadcast", content, "broadcast"))
+
+
+@app.post("/teacher/broadcast")
+def teacher_broadcast_send(request: Request, title: str = Form(...), body: str = Form(...)):
+    teacher = _require_teacher(request)
+    if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    if not title.strip() or not body.strip():
+        return RedirectResponse("/teacher/broadcast?error=Title+and+message+are+required.", status_code=303)
+    students = get_students(teacher["teacher_id"])
+    tokens = _load_push_tokens()
+    count = 0
+    for s in students:
+        token = tokens.get(f"parent:{s['student_id']}")
+        if token:
+            _send_push(token, title.strip(), body.strip(), {"screen": "Home"})
+            count += 1
+    return RedirectResponse(f"/teacher/broadcast?sent={count}", status_code=303)
+
+
+@app.get("/school/broadcast", response_class=HTMLResponse)
+def school_broadcast_page(request: Request, sent: str = "", error: str = ""):
+    school = _require_school(request)
+    if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
+    students = get_all_school_students(school["school_id"])
+    teachers = get_teachers(school["school_id"])
+    tokens = _load_push_tokens()
+    parent_count  = len([s for s in students if tokens.get(f"parent:{s['student_id']}")])
+    teacher_count = len([t for t in teachers if tokens.get(f"teacher:{t['teacher_id']}")])
+    banner = ""
+    if sent:
+        banner = f'<div class="alert alert-success" style="margin-bottom:20px;">✅ Message sent to {sent} recipient(s).</div>'
+    if error:
+        banner = f'<div class="alert alert-danger" style="margin-bottom:20px;">❌ {_esc(error)}</div>'
+    content = f"""
+{banner}
+<div class="card" style="max-width:640px;">
+  <h2 style="margin-top:0;">📣 Broadcast Message</h2>
+  <p style="color:var(--muted);font-size:14px;margin-bottom:24px;">
+    Send a push notification to all parents in your school ({parent_count} registered) and/or all teachers ({teacher_count} registered).
+  </p>
+  <form method="post" action="/school/broadcast">
+    <div class="form-group">
+      <label class="form-label">Title</label>
+      <input type="text" name="title" placeholder="e.g. School closed Monday" required maxlength="100" style="width:100%;box-sizing:border-box;">
+    </div>
+    <div class="form-group" style="margin-top:14px;">
+      <label class="form-label">Message</label>
+      <textarea name="body" rows="4" placeholder="e.g. The school will be closed Monday for the holiday." required maxlength="300" style="width:100%;padding:8px 11px;border:1.5px solid var(--border);border-radius:8px;font-size:13px;font-family:inherit;resize:vertical;"></textarea>
+    </div>
+    <div class="form-group" style="margin-top:14px;">
+      <label class="form-label">Send to</label>
+      <div style="display:flex;gap:20px;margin-top:6px;">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+          <input type="checkbox" name="send_parents" value="1" checked> Parents ({parent_count})
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+          <input type="checkbox" name="send_teachers" value="1"> Teachers ({teacher_count})
+        </label>
+      </div>
+    </div>
+    <button type="submit" class="btn" style="margin-top:20px;width:100%;">Send Notification</button>
+  </form>
+</div>"""
+    return HTMLResponse(school_page("Broadcast", content, "broadcast"))
+
+
+@app.post("/school/broadcast")
+def school_broadcast_send(
+    request: Request,
+    title: str = Form(...), body: str = Form(...),
+    send_parents: str = Form(default=""), send_teachers: str = Form(default=""),
+):
+    school = _require_school(request)
+    if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
+    if not title.strip() or not body.strip():
+        return RedirectResponse("/school/broadcast?error=Title+and+message+are+required.", status_code=303)
+    tokens = _load_push_tokens()
+    count = 0
+    if send_parents:
+        for s in get_all_school_students(school["school_id"]):
+            token = tokens.get(f"parent:{s['student_id']}")
+            if token:
+                _send_push(token, title.strip(), body.strip(), {"screen": "Home"})
+                count += 1
+    if send_teachers:
+        for t in get_teachers(school["school_id"]):
+            token = tokens.get(f"teacher:{t['teacher_id']}")
+            if token:
+                _send_push(token, title.strip(), body.strip(), {})
+                count += 1
+    return RedirectResponse(f"/school/broadcast?sent={count}", status_code=303)
 
 
 # ── Patch add-note endpoints to fire push ─────────────────────────────────────
@@ -2127,6 +3582,19 @@ async def waitlist_signup(request: Request):
     return JSONResponse({"ok": True})
 
 
+@app.get("/api/admin/waitlist")
+def admin_waitlist(request: Request):
+    """Platform-wide waitlist signups — not scoped to any tenant school, so
+    gated the same way as the backup endpoints (X-Cron-Secret), not tenant
+    auth. Nobody could previously see who signed up except by reading the
+    CSV directly on the server."""
+    if not _require_platform_admin(request):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    rows = _read_csv(WAITLIST_FILE, WAITLIST_HEADERS)
+    rows.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+    return JSONResponse({"ok": True, "count": len(rows), "signups": rows})
+
+
 # ── Stripe: create checkout session ───────────────────────────────────────────
 @app.post("/api/billing/checkout")
 async def billing_checkout(request: Request):
@@ -2165,31 +3633,49 @@ async def billing_webhook(request: Request):
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
-    if event["type"] in ("checkout.session.completed",
-                          "customer.subscription.updated"):
-        meta      = event["data"]["object"].get("metadata", {})
+    obj = event["data"]["object"]
+
+    if event["type"] == "checkout.session.completed":
+        meta      = obj.get("metadata", {})
         school_id = meta.get("school_id")
-        plan      = meta.get("plan", "solo")
+        plan      = meta.get("plan", "school")
         if school_id:
             schools = _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
-            updated = False
             for s in schools:
                 if s["school_id"] == school_id:
-                    s["plan"] = plan
-                    updated = True
-            if updated:
-                _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, schools)
+                    s["plan"]                = plan
+                    s["is_subscribed"]        = "true"
+                    s["subscription_status"]  = "active"
+                    # Capture this school's OWN Stripe customer id — not a
+                    # shared/global one — so the billing portal and any
+                    # re-checkout attach to the correct customer.
+                    if obj.get("customer"):
+                        s["stripe_customer_id"] = obj.get("customer", "")
+            _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, schools)
+
+    elif event["type"] == "customer.subscription.updated":
+        # data.object here is the Subscription itself, whose metadata only
+        # exists because subscription_data.metadata was set at checkout.
+        meta      = obj.get("metadata", {})
+        school_id = meta.get("school_id")
+        status    = obj.get("status", "active")
+        if school_id:
+            schools = _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
+            for s in schools:
+                if s["school_id"] == school_id:
+                    s["subscription_status"] = status
+            _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, schools)
 
     elif event["type"] == "customer.subscription.deleted":
-        sub       = event["data"]["object"]
-        # find school by stripe customer — we store customer_id in metadata at checkout
-        meta      = sub.get("metadata", {})
+        meta      = obj.get("metadata", {})
         school_id = meta.get("school_id")
         if school_id:
             schools = _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
             for s in schools:
                 if s["school_id"] == school_id:
-                    s["plan"] = "inactive"
+                    s["plan"]                = "inactive"
+                    s["is_subscribed"]        = "false"
+                    s["subscription_status"]  = "cancelled"
             _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, schools)
 
     return JSONResponse({"ok": True})
@@ -2234,18 +3720,51 @@ async def school_billing_checkout(request: Request, plan: str = Form(...)):
     if not price_id:
         return RedirectResponse("/school/billing?toast=Unknown+plan", status_code=303)
     stripe.api_key = STRIPE_SECRET_KEY
+    base = "https://music-school-app-hde7.onrender.com"
     try:
-        session = stripe.checkout.Session.create(
+        kwargs = dict(
             mode="subscription",
             line_items=[{"price": price_id, "quantity": 1}],
-            customer_email=school["owner_email"],
             metadata={"school_id": school["school_id"], "plan": plan},
-            success_url=f"https://music-school-app-hde7.onrender.com/school/dashboard?toast=Subscription+active",
-            cancel_url=f"https://music-school-app-hde7.onrender.com/school/billing",
+            subscription_data={"trial_period_days": 30, "metadata": {"school_id": school["school_id"]}},
+            payment_method_collection="always",
+            success_url=f"{base}/school/subscribe?success={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{base}/school/subscribe?cancelled=1",
         )
+        # Reuse this school's OWN Stripe customer if they have one (e.g.
+        # resubscribing after a cancellation), rather than creating a
+        # duplicate customer from customer_email every time.
+        existing_customer_id = school.get("stripe_customer_id", "")
+        if existing_customer_id:
+            kwargs["customer"] = existing_customer_id
+        else:
+            kwargs["customer_email"] = school["owner_email"]
+        session = stripe.checkout.Session.create(**kwargs)
         return RedirectResponse(session.url, status_code=303)
     except Exception as e:
-        return RedirectResponse(f"/school/billing?toast={str(e)[:80]}", status_code=303)
+        return RedirectResponse(f"/school/subscribe?cancelled=1&toast={str(e)[:80]}", status_code=303)
+
+
+@app.post("/school/billing/portal")
+async def school_billing_portal(request: Request):
+    """Opens the Stripe-hosted Customer Portal for this school: update
+    payment method, view invoices, or cancel — without us building any of
+    that UI ourselves."""
+    school = _require_school(request)
+    if not school: return RedirectResponse("/school/login", status_code=303)
+    customer_id = school.get("stripe_customer_id", "")
+    if not STRIPE_SECRET_KEY or not customer_id:
+        return RedirectResponse("/school/settings?toast=No+billing+account+found.+Subscribe+first.", status_code=303)
+    stripe.api_key = STRIPE_SECRET_KEY
+    base = "https://music-school-app-hde7.onrender.com"
+    try:
+        portal = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url=f"{base}/school/settings",
+        )
+        return RedirectResponse(portal.url, status_code=303)
+    except Exception as e:
+        return RedirectResponse(f"/school/settings?toast=Could+not+open+billing+portal", status_code=303)
 
 
 # ── Policy signing ─────────────────────────────────────────────────────────────
@@ -2253,14 +3772,17 @@ async def school_billing_checkout(request: Request, plan: str = Form(...)):
 def school_policies_page(request: Request, toast: str = ""):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
     policies = [p for p in _read_csv(POLICIES_FILE, POLICIES_HEADERS)
                 if p["school_id"] == school["school_id"]]
     sigs     = _read_csv(SIGNATURES_FILE, SIGNATURES_HEADERS)
-    toast_html = f'<div class="alert alert-success">{toast}</div>' if toast else ""
+    toast_html = f'<div class="alert alert-success">{_esc(toast)}</div>' if toast else ""
     rows = ""
     for p in policies:
         signed_count = len([s for s in sigs if s["policy_id"] == p["id"]])
-        rows += (f'<tr><td><strong>{p["title"]}</strong></td>'
+        pdf_badge = ' <span class="badge badge-info" style="margin-left:4px;">PDF</span>' if p.get("pdf_filename") else ''
+        rows += (f'<tr><td><strong>{_esc(p["title"])}</strong>{pdf_badge}</td>'
                  f'<td>{p["created_at"][:10]}</td>'
                  f'<td><span class="badge badge-info">{signed_count} signed</span></td>'
                  f'<td><a class="btn btn-sm btn-outline" href="/school/policies/{p["id"]}/sigs">View Signatures</a></td></tr>')
@@ -2274,14 +3796,18 @@ def school_policies_page(request: Request, toast: str = ""):
     <div class="card">{table}</div>
     <div class="card" style="max-width:600px;">
       <h2>Add Policy</h2>
-      <form method="post" action="/school/policies/add">
+      <form method="post" action="/school/policies/add" enctype="multipart/form-data">
         <div class="form-group">
           <label class="form-label">Title</label>
           <input type="text" name="title" placeholder="e.g. Studio Policy 2026" required>
         </div>
         <div class="form-group">
-          <label class="form-label">Policy Text</label>
-          <textarea name="body" rows="8" placeholder="Enter the full policy text..." required style="width:100%;padding:8px 11px;border:1.5px solid var(--border);border-radius:8px;font-size:13px;font-family:inherit;"></textarea>
+          <label class="form-label">Upload PDF (optional)</label>
+          <input type="file" name="pdf_file" accept=".pdf" style="color:var(--text);">
+        </div>
+        <div class="form-group">
+          <label class="form-label">— or — Policy Text</label>
+          <textarea name="body" rows="8" placeholder="Enter the full policy text..." style="width:100%;padding:8px 11px;border:1.5px solid var(--border);border-radius:8px;font-size:13px;font-family:inherit;"></textarea>
         </div>
         <button class="btn" type="submit">➕ Add Policy</button>
       </form>
@@ -2292,21 +3818,53 @@ def school_policies_page(request: Request, toast: str = ""):
 
 @app.post("/school/policies/add")
 async def school_add_policy(request: Request,
-                             title: str = Form(...), body: str = Form(...)):
+                             title: str = Form(...), body: str = Form(default=""),
+                             pdf_file: UploadFile = File(default=None)):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
+    if not body.strip() and not (pdf_file and pdf_file.filename):
+        return RedirectResponse("/school/policies?toast=Add+policy+text+or+upload+a+PDF", status_code=303)
+    policy_id = secrets.token_hex(8)
+    pdf_filename = ""
+    if pdf_file and pdf_file.filename:
+        os.makedirs("/data/policy_pdfs", exist_ok=True)
+        contents = await pdf_file.read()
+        with open(f"/data/policy_pdfs/{policy_id}.pdf", "wb") as f:
+            f.write(contents)
+        pdf_filename = pdf_file.filename
     _append_csv(POLICIES_FILE, POLICIES_HEADERS, {
-        "id": secrets.token_hex(8), "school_id": school["school_id"],
+        "id": policy_id, "school_id": school["school_id"],
         "title": title.strip(), "body": body.strip(),
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "pdf_filename": pdf_filename,
     })
     return RedirectResponse("/school/policies?toast=Policy+added", status_code=303)
+
+
+@app.get("/policy-pdf/{policy_id}")
+def policy_pdf(policy_id: str):
+    """Public, same posture as the /sign/{policy_id} page it's embedded in —
+    the policy's own content isn't secret, only signing requires a valid
+    student access code."""
+    policy = next((p for p in _read_csv(POLICIES_FILE, POLICIES_HEADERS)
+                   if p["id"] == policy_id), None)
+    if not policy or not policy.get("pdf_filename"):
+        return HTMLResponse("<p>No PDF uploaded.</p>", status_code=404)
+    pdf_path = f"/data/policy_pdfs/{policy_id}.pdf"
+    if not os.path.exists(pdf_path):
+        return HTMLResponse("<p>No PDF uploaded.</p>", status_code=404)
+    from fastapi.responses import FileResponse
+    return FileResponse(pdf_path, media_type="application/pdf", filename=policy["pdf_filename"])
 
 
 @app.get("/school/policies/{policy_id}/sigs", response_class=HTMLResponse)
 def policy_signatures(request: Request, policy_id: str):
     school = _require_school(request)
     if not school: return RedirectResponse("/school/login", status_code=303)
+    gate = _school_access_response(school)
+    if gate: return gate
     policy = next((p for p in _read_csv(POLICIES_FILE, POLICIES_HEADERS)
                    if p["id"] == policy_id and p["school_id"] == school["school_id"]), None)
     if not policy: return RedirectResponse("/school/policies", status_code=303)
@@ -2324,7 +3882,7 @@ def policy_signatures(request: Request, policy_id: str):
             rows += (f'<tr><td>{stu["name"]}</td>'
                      f'<td><span class="badge badge-danger">Not signed</span></td></tr>')
     content = f"""
-    <h1>📋 {policy["title"]} — Signatures</h1>
+    <h1>📋 {_esc(policy["title"])} — Signatures</h1>
     <div class="card">
       <table><thead><tr><th>Student</th><th>Status</th></tr></thead>
       <tbody>{rows or "<tr><td colspan=2>No students found.</td></tr>"}</tbody></table>
@@ -2352,9 +3910,13 @@ def policy_sign_page(request: Request, policy_id: str, code: str = ""):
                              and s["student_id"] == student["student_id"]), None)
             if existing:
                 already_signed = f'<div class="alert alert-success">✓ Already signed on {existing["signed_at"][:10]}.</div>'
+    if policy.get("pdf_filename"):
+        policy_body_html = f'<iframe src="/policy-pdf/{policy_id}" style="width:100%;height:420px;border:1px solid #e2e8f0;border-radius:12px;margin:16px 0;"></iframe>'
+    else:
+        policy_body_html = f'<div class="policy-body">{_esc(policy["body"])}</div>'
     return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset=UTF-8>
     <meta name=viewport content="width=device-width,initial-scale=1">
-    <title>Sign Policy — {policy["title"]}</title>
+    <title>Sign Policy — {_esc(policy["title"])}</title>
     <style>
       body{{font-family:-apple-system,sans-serif;background:#f8faff;padding:24px;max-width:640px;margin:0 auto;}}
       h1{{font-size:22px;font-weight:800;margin-bottom:8px;color:#1e293b;}}
@@ -2370,14 +3932,14 @@ def policy_sign_page(request: Request, policy_id: str, code: str = ""):
       .alert-success{{background:#d1fae5;color:#065f46;border:1px solid #a7f3d0;
                       padding:12px 16px;border-radius:9px;margin-bottom:14px;font-weight:600;}}
     </style></head><body>
-    <h1>📋 {policy["title"]}</h1>
+    <h1>📋 {_esc(policy["title"])}</h1>
     <p style="color:#64748b;font-size:14px;">Please read and sign this policy from {policy["school_id"]}.</p>
-    <div class="policy-body">{policy["body"]}</div>
+    {policy_body_html}
     {already_signed}
     <form method="post" action="/sign/{policy_id}">
       <div class="form-group">
         <label>Your Student Access Code</label>
-        <input type="text" name="code" value="{code}" placeholder="Enter your access code" required>
+        <input type="text" name="code" value="{_esc(code)}" placeholder="Enter your access code" required>
       </div>
       <button class="btn" type="submit">✍️ I agree &amp; sign</button>
     </form>
@@ -2415,7 +3977,7 @@ async def policy_sign_post(request: Request, policy_id: str, code: str = Form(..
     <div style="margin-top:60px;">
       <div style="font-size:64px;margin-bottom:16px;">✅</div>
       <h1 style="font-size:22px;font-weight:800;color:#1e293b;margin-bottom:8px;">Signed!</h1>
-      <p style="color:#64748b;">Thank you, {student["name"]}. Your signature has been recorded.</p>
+      <p style="color:#64748b;">Thank you, {_esc(student["name"])}. Your signature has been recorded.</p>
     </div></body></html>""")
 
 
@@ -2440,7 +4002,7 @@ def mobile_parent_policies(request: Request):
 # ── Mobile: school billing ─────────────────────────────────────────────────────
 @app.post("/api/mobile/school/billing/checkout")
 async def mobile_school_billing_checkout(request: Request):
-    school = _require_school(request)
+    school = _school_auth(request)  # mobile sends a Bearer token, not the school_id cookie
     if not school: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
     if not STRIPE_SECRET_KEY:
         return JSONResponse({"ok": False, "error": "Stripe not configured"}, status_code=503)
@@ -2451,14 +4013,257 @@ async def mobile_school_billing_checkout(request: Request):
         return JSONResponse({"ok": False, "error": "unknown plan"}, status_code=400)
     stripe.api_key = STRIPE_SECRET_KEY
     try:
-        session = stripe.checkout.Session.create(
+        kwargs = dict(
             mode="subscription",
             line_items=[{"price": price_id, "quantity": 1}],
-            customer_email=school["owner_email"],
             metadata={"school_id": school["school_id"], "plan": plan},
-            success_url=f"https://music-school-app-hde7.onrender.com/school/dashboard?toast=Subscription+active",
-            cancel_url=f"https://music-school-app-hde7.onrender.com/school/billing",
+            subscription_data={"trial_period_days": 30, "metadata": {"school_id": school["school_id"]}},
+            payment_method_collection="always",
+            # Custom URL scheme, not a web page — the mobile client opens
+            # this in an auth-session browser (expo-web-browser) that
+            # resolves in-app when Stripe redirects here, instead of
+            # stranding the user in a bare external browser tab.
+            success_url="studioconsole://ms-billing-return?session_id={CHECKOUT_SESSION_ID}",
+            cancel_url="studioconsole://ms-billing-return?cancelled=1",
         )
+        existing_customer_id = school.get("stripe_customer_id", "")
+        if existing_customer_id:
+            kwargs["customer"] = existing_customer_id
+        else:
+            kwargs["customer_email"] = school["owner_email"]
+        session = stripe.checkout.Session.create(**kwargs)
         return JSONResponse({"ok": True, "url": session.url})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.post("/api/mobile/school/billing/confirm")
+async def mobile_school_billing_confirm(request: Request):
+    """Verifies a completed checkout directly with Stripe and flips
+    is_subscribed immediately, rather than waiting on the webhook."""
+    school = _school_auth(request)
+    if not school: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    data = await request.json()
+    session_id = data.get("session_id", "")
+    if not session_id or not STRIPE_SECRET_KEY:
+        return JSONResponse({"ok": False, "error": "invalid request"}, status_code=400)
+    stripe.api_key = STRIPE_SECRET_KEY
+    try:
+        sess = stripe.checkout.Session.retrieve(session_id)
+        paid = sess.get("payment_status") in ("paid", "no_payment_required") or sess.get("status") == "complete"
+        if paid:
+            schools = _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
+            for s in schools:
+                if s["school_id"] == school["school_id"]:
+                    s["is_subscribed"]        = "true"
+                    s["subscription_status"]  = "active"
+                    s["plan"]                 = "school"
+                    if sess.get("customer"):
+                        s["stripe_customer_id"] = sess.get("customer", "")
+            _write_csv(SCHOOLS_FILE, SCHOOLS_HEADERS, schools)
+        updated_school = get_school(school["school_id"])
+        has_access, reason = school_has_access(updated_school)
+        return JSONResponse({"ok": True, "confirmed": paid, "active": has_access, "reason": reason})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)[:300]}, status_code=500)
+
+
+@app.post("/api/mobile/school/billing/portal")
+async def mobile_school_billing_portal(request: Request):
+    """Opens the Stripe-hosted Customer Portal — used when the school is
+    already subscribed and taps 'Manage Subscription', instead of running
+    a brand new checkout session on top of an active subscription."""
+    school = _school_auth(request)
+    if not school: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
+    customer_id = school.get("stripe_customer_id", "")
+    if not STRIPE_SECRET_KEY or not customer_id:
+        return JSONResponse({"ok": False, "error": "No billing account found. Subscribe first."}, status_code=400)
+    stripe.api_key = STRIPE_SECRET_KEY
+    try:
+        portal = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url="https://music-school-app-hde7.onrender.com/school/dashboard",
+        )
+        return JSONResponse({"ok": True, "url": portal.url})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+# ── Off-site backup (Cloudflare R2 — S3-compatible, free egress) ─────────────
+MS_BACKUP_DIR  = "/data/auto_backups"
+MS_CRON_SECRET = os.environ.get("CRON_SECRET", "")
+
+R2_ACCOUNT_ID        = os.environ.get("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY_ID     = os.environ.get("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET            = os.environ.get("R2_BUCKET", "")
+R2_PREFIX            = "music-school-app"
+
+_r2_client_cache = None
+
+def _r2_client():
+    """Returns a cached boto3 S3-compatible client for Cloudflare R2, or None
+    if unconfigured. Cached at module scope so we don't pay TLS/session setup
+    on every call — this is hit on every backup and every admin list/download."""
+    global _r2_client_cache
+    if not (R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET):
+        return None
+    if _r2_client_cache is None:
+        import boto3
+        from botocore.config import Config as _BotoConfig
+        _r2_client_cache = boto3.client(
+            "s3",
+            endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+            aws_access_key_id=R2_ACCESS_KEY_ID,
+            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+            config=_BotoConfig(signature_version="s3v4"),
+            region_name="auto",
+        )
+    return _r2_client_cache
+
+_BACKUP_EXCLUDE_FILES = {"secret_key"}  # session-signing secret: never leaves the server
+
+def _build_full_backup_zip() -> bytes:
+    """Zips every file under /data (all CSVs, JSON stores) except the local
+    auto_backups directory and the session-signing secret, so a restore
+    recreates the full working state without leaking the token-signing key
+    to anyone with backup-download access."""
+    import zipfile
+    from io import BytesIO
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, files in os.walk("/data"):
+            dirs[:] = [d for d in dirs if d != "auto_backups"]
+            for fn in files:
+                if fn in _BACKUP_EXCLUDE_FILES:
+                    continue
+                full = os.path.join(root, fn)
+                arc  = os.path.relpath(full, "/data")
+                zf.write(full, arcname=arc)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+@app.get("/api/cron/backup")
+def ms_cron_backup(request: Request):
+    """Daily backup: zips all of /data and uploads it to Cloudflare R2 (the
+    system of record for disaster recovery). Keeps a 7-day local copy as a
+    fast fallback. Configure remote retention with an R2 bucket lifecycle
+    rule rather than app-side deletion."""
+    if request.headers.get("X-Cron-Secret") != MS_CRON_SECRET or not MS_CRON_SECRET:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    zip_bytes = _build_full_backup_zip()
+    ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    os.makedirs(MS_BACKUP_DIR, exist_ok=True)
+    local_path = os.path.join(MS_BACKUP_DIR, f"backup_{ts}.zip")
+    with open(local_path, "wb") as f:
+        f.write(zip_bytes)
+    local_backups = sorted(
+        os.path.join(MS_BACKUP_DIR, x) for x in os.listdir(MS_BACKUP_DIR) if x.endswith(".zip")
+    )
+    for old in local_backups[:-7]:
+        os.remove(old)
+
+    offsite_uploaded = False
+    offsite_error     = None
+    client = _r2_client()
+    if client:
+        try:
+            client.put_object(Bucket=R2_BUCKET, Key=f"{R2_PREFIX}/backup_{ts}.zip", Body=zip_bytes)
+            offsite_uploaded = True
+        except Exception as exc:
+            offsite_error = str(exc)[:300]
+    else:
+        offsite_error = "R2 not configured"
+
+    schools = _read_csv(SCHOOLS_FILE, SCHOOLS_HEADERS)
+
+    # Trial expiry warnings — email at 5 days remaining
+    warned = 0
+    for s in schools:
+        if s.get("is_subscribed") == "true":
+            continue
+        trial_ends = s.get("trial_ends", "")
+        if not trial_ends:
+            continue
+        try:
+            days_left = (datetime.strptime(trial_ends, "%Y-%m-%d").date() - datetime.now().date()).days
+        except ValueError:
+            continue
+        if days_left == 5:
+            _send_email(
+                s["owner_email"],
+                "Your Music School App trial ends in 5 days",
+                (
+                    f"<p>Hi {s.get('owner_name','there')},</p>"
+                    f"<p>Your free trial of Music School App ends on <strong>{trial_ends}</strong>.</p>"
+                    f"<p>Subscribe to keep access to all your teachers, students, and data.</p>"
+                    f"<p><a href='https://music-school-app-hde7.onrender.com/school/subscribe' "
+                    f"style='display:inline-block;padding:12px 24px;background:#6366f1;color:#fff;"
+                    f"border-radius:8px;text-decoration:none;font-weight:700;'>Subscribe Now — $99/month</a></p>"
+                    f"<p style='color:#64748b;font-size:12px;'>Cancel anytime. Questions? Just reply to this email.</p>"
+                ),
+            )
+            warned += 1
+
+    return JSONResponse({
+        "status": "ok",
+        "offsite_uploaded": offsite_uploaded,
+        "offsite_error": offsite_error,
+        "local_file": local_path,
+        "local_kept": len(local_backups[-7:]),
+        "trial_warnings_sent": warned,
+    })
+
+
+def _require_platform_admin(request: Request) -> bool:
+    """The backup zip spans every tenant school's data (and, until the fix
+    above, the signing secret too) — this must NEVER be gated by tenant auth
+    like _require_school, since any paying customer could pass that check
+    and download every other customer's data. Reuses the same X-Cron-Secret
+    already used to authenticate the backup cron itself."""
+    return bool(MS_CRON_SECRET) and request.headers.get("X-Cron-Secret") == MS_CRON_SECRET
+
+@app.get("/api/admin/backups")
+def ms_list_offsite_backups(request: Request):
+    """List backups stored in R2, newest first. Platform-admin only —
+    call with an X-Cron-Secret header, not a school session."""
+    if not _require_platform_admin(request):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    client = _r2_client()
+    if not client:
+        return JSONResponse({"ok": False, "error": "R2 not configured"}, status_code=503)
+    try:
+        paginator = client.get_paginator("list_objects_v2")
+        items = []
+        for page in paginator.paginate(Bucket=R2_BUCKET, Prefix=f"{R2_PREFIX}/"):
+            items.extend(page.get("Contents", []))
+        items.sort(key=lambda o: o["LastModified"], reverse=True)
+        return JSONResponse({"ok": True, "backups": [
+            {"key": o["Key"], "size": o["Size"], "last_modified": o["LastModified"].isoformat()}
+            for o in items
+        ]})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)[:300]}, status_code=500)
+
+
+@app.get("/api/admin/backups/download")
+def ms_download_offsite_backup(request: Request, key: str = Query(...)):
+    """Download a specific R2 backup zip for manual restore or integrity
+    verification. Platform-admin only — see _require_platform_admin above.
+    Restore is deliberately not automated over HTTP."""
+    if not _require_platform_admin(request):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    if not key.startswith(f"{R2_PREFIX}/"):
+        return JSONResponse({"ok": False, "error": "invalid key"}, status_code=400)
+    client = _r2_client()
+    if not client:
+        return JSONResponse({"ok": False, "error": "R2 not configured"}, status_code=503)
+    try:
+        obj = client.get_object(Bucket=R2_BUCKET, Key=key)
+        return Response(content=obj["Body"].read(), media_type="application/zip",
+                        headers={"Content-Disposition": f'attachment; filename="{os.path.basename(key)}"'})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)[:300]}, status_code=500)
