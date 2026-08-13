@@ -26,32 +26,15 @@ reason.
 This is the first test file in this repo. It patches /data the way the other
 repo's suites do, since main.py writes there at import time.
 """
-import builtins
 import csv
-import importlib
 import os
 import sys
-import tempfile
 
 import pytest
 
-# main.py creates its CSVs under /data at import time, which cannot exist on
-# macOS. Redirect before importing, and leave the patches in place — the
-# module reads those paths again on every request.
-_DATA = tempfile.mkdtemp()
-_o, _e, _m = builtins.open, os.path.exists, os.makedirs
-
-
-def _redir(p):
-    return _DATA + str(p)[5:] if isinstance(p, (str, bytes)) and str(p).startswith("/data") else p
-
-
-builtins.open = lambda f, *a, **k: _o(_redir(f), *a, **k)
-os.path.exists = lambda p: _e(_redir(p))
-os.makedirs = lambda p, *a, **k: _m(_redir(p), *a, **k)
+from conftest import raw_exists, raw_open, redir   # /data patching lives there
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-os.environ.setdefault("SECRET_KEY", "test-secret-for-signup-closed")
 import main  # noqa: E402
 
 from fastapi.testclient import TestClient  # noqa: E402
@@ -72,10 +55,10 @@ def _valid(tag):
 
 
 def _schools():
-    path = _redir(main.SCHOOLS_FILE)
-    if not _e(path):
+    path = redir(main.SCHOOLS_FILE)
+    if not raw_exists(path):
         return []
-    with _o(path, "r") as f:
+    with raw_open(path, "r") as f:
         return list(csv.DictReader(f))
 
 
