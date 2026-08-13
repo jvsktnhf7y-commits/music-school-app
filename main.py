@@ -884,8 +884,55 @@ def terms_page():
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SCHOOL ADMIN — signup / login / dashboard
 # ═══════════════════════════════════════════════════════════════════════════════
+# Public signup is CLOSED.
+#
+# WHY. Five write routes take a student_id straight from the URL and never
+# check the student belongs to the signed-in teacher:
+#   POST /teacher/students/{id}/payment       — no ownership check at all
+#   POST /teacher/students/{id}/charge        — checks the student exists only
+#   POST /teacher/students/{id}/attendance    — checks the student exists only
+#   POST /api/mobile/teacher/students/{id}/charge   — same
+#   POST /api/mobile/teacher/students/{id}/payment  — same
+# Any teacher account can therefore move money on any student at any OTHER
+# school, and the ledger row is written under the attacker's school_id, so it
+# corrupts both schools' books at once. Reads are correctly scoped; it is the
+# writes that leak.
+#
+# This is a stopgap and NOT the fix, exactly as it was for LessonBase in
+# 81d96ecc. No invite code makes a new account safe while the write paths are
+# unscoped, because the hole is open to every account, not just new ones.
+# Reopen only after the ownership checks land AND a regression test proves a
+# second school cannot touch the first school's rows.
+SIGNUP_OPEN = False
+
+_SIGNUP_CLOSED_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Not open yet — Music School</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="login-wrap">
+  <div class="login-card">
+    <div class="login-logo">🎵</div>
+    <h1 style="text-align:center;margin-bottom:8px;font-size:20px;">Not open yet</h1>
+    <p style="text-align:center;color:var(--muted);font-size:14px;line-height:1.6;">
+      Music School isn't accepting new schools right now. If you already have an
+      account you can still <a href="/school/login" style="color:var(--primary);font-weight:600;">sign in</a>.
+    </p>
+  </div>
+</div>
+</body>
+</html>"""
+
+
 @app.get("/school/signup", response_class=HTMLResponse)
 def school_signup_page(error: str = ""):
+    # A plain page rather than a 404: the public landing page links here with
+    # "Get Early Access", and a dead end tells an interested teacher nothing.
+    if not SIGNUP_OPEN:
+        return HTMLResponse(_SIGNUP_CLOSED_HTML, status_code=403)
     err = f'<div class="alert alert-danger">{_esc(error)}</div>' if error else ""
     return HTMLResponse(f"""<!DOCTYPE html>
 <html lang="en">
@@ -943,6 +990,10 @@ async def school_signup_post(
     email:       str = Form(...),
     password:    str = Form(...),
 ):
+    # Checked before anything else, so no rate-limit state, no CSV row and no
+    # cookie can be created while signup is closed.
+    if not SIGNUP_OPEN:
+        return HTMLResponse(_SIGNUP_CLOSED_HTML, status_code=403)
     ip = _client_ip(request)
     if _rl_blocked(ip):
         return RedirectResponse("/school/signup?error=Too+many+attempts.+Try+again+in+10+minutes.", status_code=303)
@@ -980,7 +1031,10 @@ def school_login_page(error: str = ""):
         <input type="password" name="password" placeholder="••••••••" required></div>"""
     return HTMLResponse(_login_html(
         "School Admin Login", "/school/login", fields, error,
-        signup_link='No account? <a href="/school/signup" style="color:var(--primary);font-weight:600;">Create your school</a>',
+        # No "create your school" link while signup is closed — it would
+        # dead-end anyone who followed it.
+        signup_link=('No account? <a href="/school/signup" style="color:var(--primary);font-weight:600;">Create your school</a>'
+                     if SIGNUP_OPEN else ''),
         extra='<p style="text-align:center;margin-top:10px;font-size:13px;color:var(--muted);">Teacher? <a href="/teacher/login" style="color:var(--primary);font-weight:600;">Teacher login →</a></p>',
     ))
 
