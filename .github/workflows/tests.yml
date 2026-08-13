@@ -1,0 +1,59 @@
+name: tests
+
+# There was no CI in this repo. The cross-school suite is the thing that lets
+# signup reopen safely, so it has to run on every change rather than whenever
+# somebody remembers.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install -q --upgrade pip
+          pip install -q -r requirements.txt pytest "httpx<0.28"
+
+      - name: Cross-school isolation
+        run: |
+          set -o pipefail
+          python -m pytest -q -p no:warnings test_cross_school.py | tee /tmp/xschool.log
+          # A skipped suite is not a passing suite. This one exists to prove a
+          # teacher cannot touch another school's student; silently not running
+          # is the same as not having it.
+          if grep -qiE "[0-9]+ skipped" /tmp/xschool.log; then
+            echo "::error::Cross-school tests SKIPPED — isolation is unproven."
+            exit 1
+          fi
+          if ! grep -qE "[0-9]+ passed" /tmp/xschool.log; then
+            echo "::error::Cross-school tests did not report any passes."
+            exit 1
+          fi
+        env:
+          SECRET_KEY: ci-test-secret
+
+      - name: Signup stays closed
+        run: |
+          set -o pipefail
+          python -m pytest -q -p no:warnings test_signup_closed.py | tee /tmp/signup.log
+          if grep -qiE "[0-9]+ skipped" /tmp/signup.log; then
+            echo "::error::Signup tests SKIPPED."
+            exit 1
+          fi
+        env:
+          SECRET_KEY: ci-test-secret
+
+      - name: Everything
+        run: python -m pytest -q -p no:warnings
+        env:
+          SECRET_KEY: ci-test-secret

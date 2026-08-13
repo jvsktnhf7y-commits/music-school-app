@@ -452,8 +452,27 @@ def get_all_school_students(school_id: str) -> list[dict]:
             if s["school_id"] == school_id]
 
 def get_student(student_id: str) -> dict | None:
+    """Fetch by id across EVERY school. Callers must check ownership.
+
+    Kept unscoped because the school-admin views legitimately reach students
+    they do not teach. Anything acting on behalf of a teacher should use
+    _own_student instead — five write routes used this directly and never
+    compared teacher_id, which is how money could be moved between schools.
+    """
     return next((s for s in _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
                  if s["student_id"] == student_id), None)
+
+
+def _own_student(teacher: dict, student_id: str) -> dict | None:
+    """The student, but only if this teacher actually teaches them.
+
+    student_id arrives from the URL, so it is attacker-controlled. Every
+    teacher-acting route that reads or writes a student goes through here.
+    """
+    student = get_student(student_id)
+    if not student or student.get("teacher_id") != (teacher or {}).get("teacher_id"):
+        return None
+    return student
 
 
 # ── Per-teacher calendar sync (iCal) ────────────────────────────────────────────
@@ -1892,15 +1911,20 @@ def teacher_student_detail(student_id: str, request: Request, toast: str = ""):
 async def teacher_record_payment(student_id: str, request: Request, amount: float = Form(...)):
     teacher = _require_teacher(request)
     if not teacher: return RedirectResponse("/teacher/login", status_code=303)
+    student = _own_student(teacher, student_id)
+    if not student: return RedirectResponse("/teacher/students", status_code=303)
     rows = _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
     for r in rows:
-        if r["student_id"] == student_id:
+        # teacher_id is matched here too, not only in the guard above. If the
+        # guard is ever dropped the write still cannot cross schools — this
+        # loop is the thing that actually moves the money.
+        if r["student_id"] == student_id and r["teacher_id"] == teacher["teacher_id"]:
             r["prepaid"] = f"{float(r.get('prepaid',0)) + amount:.2f}"
     _write_csv(STUDENTS_FILE, STUDENTS_HEADERS, rows)
     _append_csv(LEDGER_FILE, LEDGER_HEADERS, {
         "id": secrets.token_hex(6), "school_id": teacher["school_id"],
         "teacher_id": teacher["teacher_id"], "student_id": student_id,
-        "student_name": get_student(student_id).get("name",""),
+        "student_name": student.get("name",""),
         "date": datetime.now().strftime("%Y-%m-%d"),
         "status": "Payment", "amount": f"{amount:.2f}", "notes": "",
     })
@@ -1911,16 +1935,17 @@ async def teacher_record_payment(student_id: str, request: Request, amount: floa
 async def teacher_charge_student(student_id: str, request: Request, amount: float = Form(...)):
     teacher = _require_teacher(request)
     if not teacher: return RedirectResponse("/teacher/login", status_code=303)
-    student = get_student(student_id)
+    student = _own_student(teacher, student_id)
+    if not student: return RedirectResponse("/teacher/students", status_code=303)
     rows = _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
     for r in rows:
-        if r["student_id"] == student_id:
+        if r["student_id"] == student_id and r["teacher_id"] == teacher["teacher_id"]:
             r["prepaid"] = f"{float(r.get('prepaid',0)) - amount:.2f}"
     _write_csv(STUDENTS_FILE, STUDENTS_HEADERS, rows)
     _append_csv(LEDGER_FILE, LEDGER_HEADERS, {
         "id": secrets.token_hex(6), "school_id": teacher["school_id"],
         "teacher_id": teacher["teacher_id"], "student_id": student_id,
-        "student_name": student.get("name","") if student else "",
+        "student_name": student.get("name",""),
         "date": datetime.now().strftime("%Y-%m-%d"),
         "status": "Lesson Charged", "amount": f"-{amount:.2f}", "notes": "",
     })
@@ -1932,7 +1957,7 @@ async def teacher_record_attendance(student_id: str, request: Request,
     date: str = Form(...), status: str = Form(...)):
     teacher = _require_teacher(request)
     if not teacher: return RedirectResponse("/teacher/login", status_code=303)
-    student = get_student(student_id)
+    student = _own_student(teacher, student_id)
     if not student: return RedirectResponse("/teacher/students", status_code=303)
     rate = float(student.get("rate", 50))
     # Confirmed = charge lesson; Cancelled = give make-up credit (no charge); Missed = charge
@@ -1941,7 +1966,7 @@ async def teacher_record_attendance(student_id: str, request: Request,
         amount = -rate
         rows = _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
         for r in rows:
-            if r["student_id"] == student_id:
+            if r["student_id"] == student_id and r["teacher_id"] == teacher["teacher_id"]:
                 r["prepaid"] = f"{float(r.get('prepaid',0)) - rate:.2f}"
         _write_csv(STUDENTS_FILE, STUDENTS_HEADERS, rows)
     elif status == "Cancelled":
@@ -2175,7 +2200,7 @@ async def teacher_add_note_post(request: Request,
     notes: str = Form(""), assignment: str = Form("")):
     teacher = _require_teacher(request)
     if not teacher: return RedirectResponse("/teacher/login", status_code=303)
-    student = get_student(student_id)
+    student = _own_student(teacher, student_id)
     if student:
         _save_note_and_notify(teacher, student_id, student, date,
                               notes.strip(), assignment.strip())
@@ -2245,16 +2270,18 @@ async def teacher_record_payment_post(request: Request,
     date: str = Form(...), notes: str = Form("")):
     teacher = _require_teacher(request)
     if not teacher: return RedirectResponse("/teacher/login", status_code=303)
-    student = get_student(student_id)
+    student = _own_student(teacher, student_id)
+    if not student:
+        return RedirectResponse("/teacher/payments?toast=Student+not+found", status_code=303)
     rows = _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
     for r in rows:
-        if r["student_id"] == student_id:
+        if r["student_id"] == student_id and r["teacher_id"] == teacher["teacher_id"]:
             r["prepaid"] = f"{float(r.get('prepaid',0)) + amount:.2f}"
     _write_csv(STUDENTS_FILE, STUDENTS_HEADERS, rows)
     _append_csv(LEDGER_FILE, LEDGER_HEADERS, {
         "id": secrets.token_hex(6), "school_id": teacher["school_id"],
         "teacher_id": teacher["teacher_id"], "student_id": student_id,
-        "student_name": student.get("name","") if student else "",
+        "student_name": student.get("name",""),
         "date": date, "status": "Payment",
         "amount": f"{amount:.2f}", "notes": notes.strip(),
     })
@@ -2778,11 +2805,13 @@ async def mobile_teacher_charge(student_id: str, request: Request):
     if not teacher: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
     data   = await request.json()
     amount = float(data.get("amount", 0))
-    student = get_student(student_id)
+    # Same 404 as a student who does not exist: a teacher probing ids should
+    # not learn which ones belong to another school.
+    student = _own_student(teacher, student_id)
     if not student: return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
     rows = _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
     for r in rows:
-        if r["student_id"] == student_id:
+        if r["student_id"] == student_id and r["teacher_id"] == teacher["teacher_id"]:
             r["prepaid"] = f"{float(r.get('prepaid', 0)) - amount:.2f}"
     _write_csv(STUDENTS_FILE, STUDENTS_HEADERS, rows)
     _append_csv(LEDGER_FILE, LEDGER_HEADERS, {
@@ -2800,11 +2829,11 @@ async def mobile_teacher_payment(student_id: str, request: Request):
     if not teacher: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
     data   = await request.json()
     amount = float(data.get("amount", 0))
-    student = get_student(student_id)
+    student = _own_student(teacher, student_id)
     if not student: return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
     rows = _read_csv(STUDENTS_FILE, STUDENTS_HEADERS)
     for r in rows:
-        if r["student_id"] == student_id:
+        if r["student_id"] == student_id and r["teacher_id"] == teacher["teacher_id"]:
             r["prepaid"] = f"{float(r.get('prepaid', 0)) + amount:.2f}"
     _write_csv(STUDENTS_FILE, STUDENTS_HEADERS, rows)
     _append_csv(LEDGER_FILE, LEDGER_HEADERS, {
@@ -2836,7 +2865,7 @@ async def mobile_teacher_add_note(request: Request):
     if not teacher: return JSONResponse({"ok": False, "error": "unauthenticated"}, status_code=401)
     data       = await request.json()
     student_id = data.get("student_id", "").strip()
-    student    = get_student(student_id)
+    student    = _own_student(teacher, student_id)
     if not student: return JSONResponse({"ok": False, "error": "student not found"}, status_code=404)
     _save_note_and_notify(teacher, student_id, student,
                           data.get("date", datetime.now().strftime("%Y-%m-%d")),
